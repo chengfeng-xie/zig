@@ -1255,11 +1255,11 @@ pub fn resolveSymbols(self: *Elf) !void {
 
     {
         // Dedup groups.
-        var table = std.StringHashMap(Ref).init(self.base.comp.gpa);
-        defer table.deinit();
+        var table: std.hash_map.String(Ref) = .empty;
+        defer table.deinit(self.base.comp.gpa);
 
         for (self.objects.items) |index| {
-            try self.file(index).?.object.resolveGroups(self, &table);
+            try self.file(index).?.object.resolveGroups(self.base.comp.gpa, self, &table);
         }
 
         for (self.objects.items) |index| {

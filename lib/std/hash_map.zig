@@ -10,12 +10,12 @@ const Alignment = std.mem.Alignment;
 
 pub fn getAutoHashFn(comptime K: type, comptime Context: type) (fn (Context, K) u64) {
     comptime {
-        assert(@hasDecl(std, "StringHashMap")); // detect when the following message needs updated
+        assert(@hasDecl(@This(), "String")); // detect when the following message needs updated
         if (K == []const u8) {
             @compileError("std.hash.autoHash does not allow slices here (" ++
                 @typeName(K) ++
                 ") because the intent is unclear. " ++
-                "Consider using std.StringHashMap for hashing the contents of []const u8. " ++
+                "Consider using std.hash_map.String for hashing the contents of []const u8. " ++
                 "Alternatively, consider using std.hash.autoHashStrat or providing your own hash function instead.");
         }
     }
@@ -904,8 +904,8 @@ pub fn Custom(
                 @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call cloneContext instead.");
             return self.cloneContext(allocator, @as(Context, undefined));
         }
-        pub fn cloneContext(self: Self, allocator: Allocator, new_ctx: anytype) Allocator.Error!Self(K, V, @TypeOf(new_ctx), max_load_percentage) {
-            var other: Self(K, V, @TypeOf(new_ctx), max_load_percentage) = .empty;
+        pub fn cloneContext(self: Self, allocator: Allocator, new_ctx: anytype) Allocator.Error!Custom(K, V, @TypeOf(new_ctx), max_load_percentage) {
+            var other: Custom(K, V, @TypeOf(new_ctx), max_load_percentage) = .empty;
             if (self.size == 0)
                 return other;
 
@@ -1178,7 +1178,7 @@ test "ensureTotalCapacity" {
     var map: Auto(i32, i32) = .empty;
     defer map.deinit(gpa);
 
-    try map.ensureTotalCapacity(20);
+    try map.ensureTotalCapacity(gpa, 20);
     const initial_capacity = map.capacity();
     try testing.expect(initial_capacity >= 20);
     var i: i32 = 0;
@@ -1281,7 +1281,7 @@ test "clone" {
     try expectEqual(b.get(2).?, 2);
     try expectEqual(b.get(3).?, 3);
 
-    var original: Auto(332, i32) = .empty;
+    var original: Auto(i32, i32) = .empty;
     defer original.deinit(gpa);
 
     var i: u8 = 0;
@@ -1306,7 +1306,7 @@ test "ensureTotalCapacity with existing elements" {
 
     try map.put(gpa, 0, 0);
     try expectEqual(map.count(), 1);
-    try expectEqual(map.capacity(), @TypeOf(map).Unmanaged.minimal_capacity);
+    try expectEqual(map.capacity(), @TypeOf(map).minimal_capacity);
 
     try map.ensureTotalCapacity(gpa, 65);
     try expectEqual(map.count(), 1);
@@ -1813,7 +1813,8 @@ test "rehash" {
         }
     }
 
-    map.rehash();
+    const ctx: AutoContext(usize) = .{};
+    map.rehash(ctx);
 
     try expectEqual(map.count(), count * 2 / 3);
 

@@ -329,7 +329,7 @@ const Node = union(enum) {
 const Toc = struct {
     nodes: []Node,
     toc: []u8,
-    urls: std.StringHashMap(Token),
+    urls: std.hash_map.String(Token),
 };
 
 const Action = enum {
@@ -338,8 +338,8 @@ const Action = enum {
 };
 
 fn genToc(gpa: Allocator, tokenizer: *Tokenizer) !Toc {
-    var urls = std.StringHashMap(Token).init(gpa);
-    errdefer urls.deinit();
+    var urls: std.hash_map.String(Token) = .empty;
+    errdefer urls.deinit(gpa);
 
     var header_stack_size: usize = 0;
     var last_action: Action = .open;
@@ -416,7 +416,7 @@ fn genToc(gpa: Allocator, tokenizer: *Tokenizer) !Toc {
                             .n = header_stack_size + 1, // highest-level section headers start at h2
                         },
                     });
-                    if (try urls.fetchPut(urlized, tag_token)) |kv| {
+                    if (try urls.fetchPut(gpa, urlized, tag_token)) |kv| {
                         parseError(tokenizer, tag_token, "duplicate header url: #{s}", .{urlized}) catch {};
                         parseError(tokenizer, kv.value, "other tag here", .{}) catch {};
                         return error.ParseError;

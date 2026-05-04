@@ -319,11 +319,12 @@ test "Random float coverage" {
 test "Random float chi-square goodness of fit" {
     const num_numbers = 100000;
     const num_buckets = 1000;
+    const gpa = std.testing.allocator;
 
-    var f32_hist = std.AutoHashMap(u32, u32).init(std.testing.allocator);
-    defer f32_hist.deinit();
-    var f64_hist = std.AutoHashMap(u64, u32).init(std.testing.allocator);
-    defer f64_hist.deinit();
+    var f32_hist: std.hash_map.Auto(u32, u32) = .empty;
+    defer f32_hist.deinit(gpa);
+    var f64_hist: std.hash_map.Auto(u64, u32) = .empty;
+    defer f64_hist.deinit(gpa);
 
     var prng = DefaultPrng.init(0);
     const random = prng.random();
@@ -332,13 +333,13 @@ test "Random float chi-square goodness of fit" {
     while (i < num_numbers) : (i += 1) {
         const rand_f32 = random.float(f32);
         const rand_f64 = random.float(f64);
-        const f32_put = try f32_hist.getOrPut(@as(u32, @intFromFloat(rand_f32 * @as(f32, @floatFromInt(num_buckets)))));
+        const f32_put = try f32_hist.getOrPut(gpa, @as(u32, @intFromFloat(rand_f32 * @as(f32, @floatFromInt(num_buckets)))));
         if (f32_put.found_existing) {
             f32_put.value_ptr.* += 1;
         } else {
             f32_put.value_ptr.* = 1;
         }
-        const f64_put = try f64_hist.getOrPut(@as(u32, @intFromFloat(rand_f64 * @as(f64, @floatFromInt(num_buckets)))));
+        const f64_put = try f64_hist.getOrPut(gpa, @as(u32, @intFromFloat(rand_f64 * @as(f64, @floatFromInt(num_buckets)))));
         if (f64_put.found_existing) {
             f64_put.value_ptr.* += 1;
         } else {

@@ -178,8 +178,8 @@ fn fetchTarget(
     try headers_dir.deleteTree(io, dest_path);
 
     var dest_dir = try headers_dir.createDirPathOpen(io, dest_path, .{});
-    var dirs = std.StringHashMap(Dir).init(arena);
-    try dirs.putNoClobber(".", dest_dir);
+    var dirs: std.hash_map.String(Dir) = .empty;
+    try dirs.putNoClobber(arena, ".", dest_dir);
 
     var headers_list_file_reader = headers_list_file.reader(io, &.{});
     const headers_list_str = try headers_list_file_reader.interface.allocRemaining(arena, .unlimited);
@@ -192,7 +192,7 @@ fn fetchTarget(
             const out_rel_path = line[idx + prefix.len + 1 ..];
             const out_rel_path_stripped = mem.trim(u8, out_rel_path, " \\");
             const dirname = Dir.path.dirname(out_rel_path_stripped) orelse ".";
-            const maybe_dir = try dirs.getOrPut(dirname);
+            const maybe_dir = try dirs.getOrPut(arena, dirname);
             if (!maybe_dir.found_existing) {
                 maybe_dir.value_ptr.* = try dest_dir.createDirPathOpen(io, dirname, .{});
             }

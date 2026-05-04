@@ -22,7 +22,7 @@ pub const YamlError = error{
 } || ParseError || std.fmt.ParseIntError;
 
 pub const List = []Value;
-pub const Map = std.StringHashMap(Value);
+pub const Map = std.hash_map.String(Value);
 
 pub const Value = union(enum) {
     empty,
@@ -154,8 +154,8 @@ pub const Value = union(enum) {
         } else if (node.cast(Node.Map)) |map| {
             // TODO use ContextAdapted HashMap and do not duplicate keys, intern
             // in a contiguous string buffer.
-            var out_map = std.StringHashMap(Value).init(arena);
-            try out_map.ensureUnusedCapacity(math.cast(u32, map.values.items.len) orelse return error.Overflow);
+            var out_map: std.hash_map.String(Value) = .empty;
+            try out_map.ensureUnusedCapacity(arena, math.cast(u32, map.values.items.len) orelse return error.Overflow);
 
             for (map.values.items) |entry| {
                 const key = try arena.dupe(u8, tree.getRaw(entry.key, entry.key));
@@ -222,9 +222,9 @@ pub const Value = union(enum) {
 
                 return Value{ .list = try list.toOwnedSlice(arena) };
             } else {
-                var map = Map.init(arena);
-                errdefer map.deinit();
-                try map.ensureTotalCapacity(info.fields.len);
+                var map: Map = .empty;
+                errdefer map.deinit(arena);
+                try map.ensureTotalCapacity(arena, info.fields.len);
 
                 inline for (info.fields) |field| {
                     if (try encode(arena, @field(input, field.name))) |value| {

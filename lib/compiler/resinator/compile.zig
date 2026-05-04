@@ -1699,10 +1699,10 @@ pub const Compiler = struct {
             height,
         );
 
-        var controls_by_id = std.AutoHashMap(u32, *const Node.ControlStatement).init(self.allocator);
+        var controls_by_id: std.hash_map.Auto(u32, *const Node.ControlStatement) = .empty;
         // Number of controls are guaranteed by the parser to be within maxInt(u16).
-        try controls_by_id.ensureTotalCapacity(@as(u16, @intCast(node.controls.len)));
-        defer controls_by_id.deinit();
+        try controls_by_id.ensureTotalCapacity(self.allocator, @as(u16, @intCast(node.controls.len)));
+        defer controls_by_id.deinit(self.allocator);
 
         for (node.controls) |control_node| {
             const control: *Node.ControlStatement = @alignCast(@fieldParentPtr("base", control_node));
@@ -1811,7 +1811,7 @@ pub const Compiler = struct {
         data_writer: *std.Io.Writer,
         resource: ResourceType,
         bytes_written_so_far: u32,
-        controls_by_id: *std.AutoHashMap(u32, *const Node.ControlStatement),
+        controls_by_id: *std.hash_map.Auto(u32, *const Node.ControlStatement),
     ) !void {
         const control_type = rc.Control.map.get(control.type.slice(self.source)).?;
 

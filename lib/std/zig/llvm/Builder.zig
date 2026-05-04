@@ -6404,10 +6404,10 @@ pub const WipFunction = struct {
 
         var wip_name: struct {
             next_name: String = @enumFromInt(0),
-            next_unique_name: std.AutoHashMap(String, String),
+            next_unique_name: std.hash_map.Auto(String, String),
             builder: *Builder,
 
-            fn map(wip_name: *@This(), name: String, sep: []const u8) Allocator.Error!String {
+            fn map(wip_name: *@This(), allocator: Allocator, name: String, sep: []const u8) Allocator.Error!String {
                 switch (name) {
                     .none => return .none,
                     .empty => {
@@ -6417,7 +6417,7 @@ pub const WipFunction = struct {
                     },
                     _ => {
                         assert(!name.isAnon());
-                        const gop = try wip_name.next_unique_name.getOrPut(name);
+                        const gop = try wip_name.next_unique_name.getOrPut(allocator, name);
                         if (!gop.found_existing) {
                             gop.value_ptr.* = @enumFromInt(0);
                             return name;
@@ -6430,7 +6430,7 @@ pub const WipFunction = struct {
                                 sep,
                                 gop.value_ptr.fmtRaw(wip_name.builder),
                             });
-                            const unique_gop = try wip_name.next_unique_name.getOrPut(unique_name);
+                            const unique_gop = try wip_name.next_unique_name.getOrPut(allocator, unique_name);
                             if (!unique_gop.found_existing) {
                                 unique_gop.value_ptr.* = @enumFromInt(0);
                                 return unique_name;
@@ -6440,10 +6440,10 @@ pub const WipFunction = struct {
                 }
             }
         } = .{
-            .next_unique_name = std.AutoHashMap(String, String).init(gpa),
+            .next_unique_name = .empty,
             .builder = self.builder,
         };
-        defer wip_name.next_unique_name.deinit();
+        defer wip_name.next_unique_name.deinit(gpa);
 
         var value_index: u32 = 0;
         for (0..params_len) |param_index| {
@@ -6456,6 +6456,7 @@ pub const WipFunction = struct {
             value_index += 1;
             function.instructions.appendAssumeCapacity(argument);
             names[@intFromEnum(new_argument_index)] = try wip_name.map(
+                gpa,
                 if (self.strip) .empty else self.names.items[@intFromEnum(old_argument_index)],
                 ".",
             );
@@ -6473,7 +6474,7 @@ pub const WipFunction = struct {
                 .tag = .block,
                 .data = current_block.incoming,
             });
-            names[@intFromEnum(new_block_index)] = try wip_name.map(current_block.name, "");
+            names[@intFromEnum(new_block_index)] = try wip_name.map(gpa, current_block.name, "");
             for (current_block.instructions.items) |old_instruction_index| {
                 const new_instruction_index: Instruction.Index = @enumFromInt(function.instructions.len);
                 var instruction = self.instructions.get(@intFromEnum(old_instruction_index));
@@ -6784,7 +6785,7 @@ pub const WipFunction = struct {
                     },
                 }
                 function.instructions.appendAssumeCapacity(instruction);
-                names[@intFromEnum(new_instruction_index)] = try wip_name.map(if (self.strip)
+                names[@intFromEnum(new_instruction_index)] = try wip_name.map(gpa, if (self.strip)
                     if (old_instruction_index.hasResultWip(self)) .empty else .none
                 else
                     self.names.items[@intFromEnum(old_instruction_index)], ".");

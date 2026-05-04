@@ -3931,12 +3931,12 @@ fn createModule(
             // If this returns null, we let it fall through to the case below which will
             // run the full parse function and do proper error handling.
             if (std.Target.Query.parseCpuArch(target_parse_options)) |cpu_arch| {
-                var llvm_to_zig_name = std.StringHashMap([]const u8).init(gpa);
-                defer llvm_to_zig_name.deinit();
+                var llvm_to_zig_name: std.hash_map.String([]const u8) = .empty;
+                defer llvm_to_zig_name.deinit(gpa);
 
                 for (cpu_arch.allFeaturesList()) |feature| {
                     const llvm_name = feature.llvm_name orelse continue;
-                    try llvm_to_zig_name.put(llvm_name, feature.name);
+                    try llvm_to_zig_name.put(gpa, llvm_name, feature.name);
                 }
 
                 var mcpu_buffer = std.array_list.Managed(u8).init(gpa);

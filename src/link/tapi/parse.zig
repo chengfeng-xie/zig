@@ -193,7 +193,7 @@ pub const Tree = struct {
     allocator: Allocator,
     source: []const u8,
     tokens: []Token,
-    line_cols: std.AutoHashMap(TokenIndex, LineCol),
+    line_cols: std.hash_map.Auto(TokenIndex, LineCol),
     docs: std.ArrayList(*Node) = .empty,
 
     pub fn init(allocator: Allocator) Tree {
@@ -201,13 +201,13 @@ pub const Tree = struct {
             .allocator = allocator,
             .source = undefined,
             .tokens = undefined,
-            .line_cols = std.AutoHashMap(TokenIndex, LineCol).init(allocator),
+            .line_cols = .empty,
         };
     }
 
     pub fn deinit(self: *Tree) void {
         self.allocator.free(self.tokens);
-        self.line_cols.deinit();
+        self.line_cols.deinit(self.allocator);
         for (self.docs.items) |doc| {
             doc.deinit(self.allocator);
         }
@@ -242,7 +242,7 @@ pub const Tree = struct {
             const tok_id = tokens.items.len;
             try tokens.append(token);
 
-            try self.line_cols.putNoClobber(tok_id, .{
+            try self.line_cols.putNoClobber(self.allocator, tok_id, .{
                 .line = line,
                 .col = token.start - prev_line_last_col,
             });
@@ -292,7 +292,7 @@ const Parser = struct {
     allocator: Allocator,
     tree: *Tree,
     token_it: *TokenIterator,
-    line_cols: *const std.AutoHashMap(TokenIndex, LineCol),
+    line_cols: *const std.hash_map.Auto(TokenIndex, LineCol),
 
     fn value(self: *Parser) ParseError!?*Node {
         self.eatCommentsAndSpace(&.{});

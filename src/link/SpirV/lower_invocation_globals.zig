@@ -69,10 +69,10 @@ const ModuleInfo = struct {
     ) BinaryModule.ParseError!ModuleInfo {
         var entry_points: std.array_hash_map.Auto(ResultId, void) = .empty;
         var functions: std.array_hash_map.Auto(ResultId, Fn) = .empty;
-        var fn_types = std.AutoHashMap(ResultId, struct {
+        var fn_types: std.hash_map.Auto(ResultId, struct {
             return_type: ResultId,
             param_types: []const ResultId,
-        }).init(arena);
+        }) = .empty;
         var calls: std.array_hash_map.Auto(ResultId, void) = .empty;
         var callee_store = std.array_list.Managed(ResultId).init(arena);
         var function_invocation_globals: std.array_hash_map.Auto(ResultId, void) = .empty;
@@ -101,7 +101,7 @@ const ModuleInfo = struct {
                     const return_type: ResultId = @enumFromInt(inst.operands[1]);
                     const param_types: []const ResultId = @ptrCast(inst.operands[2..]);
 
-                    const entry = try fn_types.getOrPut(fn_type);
+                    const entry = try fn_types.getOrPut(arena, fn_type);
                     if (entry.found_existing) {
                         log.err("Function type {f} has duplicate definition", .{fn_type});
                         return error.DuplicateId;

@@ -837,16 +837,16 @@ test "min heap iterator" {
     const gpa = std.testing.allocator;
 
     var queue: MinHeap = .empty;
-    var map = std.AutoHashMap(u32, void).init(testing.allocator);
+    var map: std.hash_map.Auto(u32, void) = .empty;
     defer {
         queue.deinit(gpa);
-        map.deinit();
+        map.deinit(gpa);
     }
 
     const items = [_]u32{ 54, 12, 7, 23, 25, 13 };
     for (items) |e| {
         _ = try queue.push(gpa, e);
-        _ = try map.put(e, {});
+        _ = try map.put(gpa, e, {});
     }
 
     var it = queue.iterator();

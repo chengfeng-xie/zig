@@ -686,14 +686,14 @@ pub fn resolveLiterals(self: *Object, lp: *MachO.LiteralPool, macho_file: *MachO
     var buffer = std.array_list.Managed(u8).init(gpa);
     defer buffer.deinit();
 
-    var sections_data = std.AutoHashMap(u32, []const u8).init(gpa);
-    try sections_data.ensureTotalCapacity(@intCast(self.sections.items(.header).len));
+    var sections_data: std.hash_map.Auto(u32, []const u8) = .empty;
+    try sections_data.ensureTotalCapacity(gpa, @intCast(self.sections.items(.header).len));
     defer {
         var it = sections_data.iterator();
         while (it.next()) |entry| {
             gpa.free(entry.value_ptr.*);
         }
-        sections_data.deinit();
+        sections_data.deinit(gpa);
     }
 
     const slice = self.sections.slice();
@@ -732,7 +732,7 @@ pub fn resolveLiterals(self: *Object, lp: *MachO.LiteralPool, macho_file: *MachO
                 const target_size = try macho_file.cast(usize, target.size);
                 try buffer.ensureUnusedCapacity(target_size);
                 buffer.resize(target_size) catch unreachable;
-                const gop = try sections_data.getOrPut(target.n_sect);
+                const gop = try sections_data.getOrPut(gpa, target.n_sect);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = try self.readSectionData(gpa, io, file, @intCast(target.n_sect));
                 }
@@ -966,11 +966,11 @@ fn initSymbolStabs(self: *Object, allocator: Allocator, nlists: anytype, macho_f
     // We need to cache nlists by name so that we can properly resolve local N_GSYM stabs.
     // What happens is `ld -r` will emit an N_GSYM stab for a symbol that may be either an
     // external or private external.
-    var addr_lookup = std.StringHashMap(u64).init(allocator);
-    defer addr_lookup.deinit();
+    var addr_lookup: std.hash_map.String(u64) = .empty;
+    defer addr_lookup.deinit(allocator);
     for (syms) |sym| {
         if (sym.n_type.bits.type == .sect and (sym.n_type.bits.ext or sym.n_type.bits.pext)) {
-            try addr_lookup.putNoClobber(self.getNStrx(sym.n_strx), sym.n_value);
+            try addr_lookup.putNoClobber(allocator, self.getNStrx(sym.n_strx), sym.n_value);
         }
     }
 

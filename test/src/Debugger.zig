@@ -1879,14 +1879,14 @@ pub fn addTestsForTarget(db: *Debugger, target: *const Target) void {
                 \\        return lhs == rhs;
                 \\    }
                 \\};
-                \\const Map = std.HashMap(u32, u32, Context, 63);
+                \\const Map = std.hash_map.Custom(u32, u32, Context, 63);
                 \\fn testHashMap(map: Map) void {
                 \\    _ = map;
                 \\}
                 \\pub fn main() !void {
-                \\    var map = Map.init(std.heap.page_allocator);
-                \\    defer map.deinit();
-                \\    try map.ensureTotalCapacity(10);
+                \\    var map: Map = .empty;
+                \\    defer map.deinit(std.heap.page_allocator);
+                \\    try map.ensureTotalCapacity(std.heap.page_allocator, 10);
                 \\    map.putAssumeCapacity(0, 1);
                 \\    map.putAssumeCapacity(2, 3);
                 \\    map.putAssumeCapacity(4, 5);
@@ -1906,24 +1906,24 @@ pub fn addTestsForTarget(db: *Debugger, target: *const Target) void {
     ,
         &.{
             \\(lldb) frame variable --show-types -- map.unmanaged
-            \\(std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63)) map.unmanaged = len=5 capacity=16 {
-            \\  (std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63).KV) [0] = {
+            \\(std.hash_map.Custom(u32,u32,main.Context,63)) map.unmanaged = len=5 capacity=16 {
+            \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [0] = {
             \\    (u32) .key = 0
             \\    (u32) .value = 1
             \\  }
-            \\  (std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63).KV) [1] = {
+            \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [1] = {
             \\    (u32) .key = 2
             \\    (u32) .value = 3
             \\  }
-            \\  (std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63).KV) [2] = {
+            \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [2] = {
             \\    (u32) .key = 4
             \\    (u32) .value = 5
             \\  }
-            \\  (std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63).KV) [3] = {
+            \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [3] = {
             \\    (u32) .key = 6
             \\    (u32) .value = 7
             \\  }
-            \\  (std.hash_map.HashMapUnmanaged(u32,u32,main.Context,63).KV) [4] = {
+            \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [4] = {
             \\    (u32) .key = 8
             \\    (u32) .value = 9
             \\  }

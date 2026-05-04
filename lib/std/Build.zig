@@ -8,7 +8,7 @@ const mem = std.mem;
 const panic = std.debug.panic;
 const assert = std.debug.assert;
 const log = std.log;
-const StringHashMap = std.StringHashMap;
+const StringHashMap = std.hash_map.String;
 const Allocator = std.mem.Allocator;
 const Target = std.Target;
 const process = std.process;
@@ -280,8 +280,8 @@ pub fn create(
         .verbose_llvm_cpu_features = false,
         .invalid_user_input = false,
         .allocator = arena,
-        .user_input_options = UserInputOptionsMap.init(arena),
-        .available_options_map = AvailableOptionsMap.init(arena),
+        .user_input_options = .empty,
+        .available_options_map = .empty,
         .available_options_list = std.array_list.Managed(AvailableOption).init(arena),
         .top_level_steps = .{},
         .default_step = undefined,
@@ -367,7 +367,7 @@ fn createChildOnly(
             .description = "Remove build artifacts from prefix path",
         },
         .user_input_options = user_input_options,
-        .available_options_map = AvailableOptionsMap.init(allocator),
+        .available_options_map = .empty,
         .available_options_list = std.array_list.Managed(AvailableOption).init(allocator),
         .verbose = parent.verbose,
         .verbose_link = parent.verbose_link,
@@ -416,7 +416,7 @@ fn createChildOnly(
 }
 
 fn userInputOptionsFromArgs(arena: Allocator, args: anytype) UserInputOptionsMap {
-    var map = UserInputOptionsMap.init(arena);
+    var map: UserInputOptionsMap = .empty;
     inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| {
         if (field.type == @TypeOf(null)) continue;
         addUserInputOptionFromArg(arena, &map, field, field.type, @field(args, field.name));
@@ -434,38 +434,38 @@ fn addUserInputOptionFromArg(
 ) void {
     switch (T) {
         Target.Query => return if (maybe_value) |v| {
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .scalar = v.zigTriple(arena) catch @panic("OOM") },
                 .used = false,
             }) catch @panic("OOM");
-            map.put("cpu", .{
+            map.put(arena, "cpu", .{
                 .name = "cpu",
                 .value = .{ .scalar = v.serializeCpuAlloc(arena) catch @panic("OOM") },
                 .used = false,
             }) catch @panic("OOM");
         },
         ResolvedTarget => return if (maybe_value) |v| {
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .scalar = v.query.zigTriple(arena) catch @panic("OOM") },
                 .used = false,
             }) catch @panic("OOM");
-            map.put("cpu", .{
+            map.put(arena, "cpu", .{
                 .name = "cpu",
                 .value = .{ .scalar = v.query.serializeCpuAlloc(arena) catch @panic("OOM") },
                 .used = false,
             }) catch @panic("OOM");
         },
         std.zig.BuildId => return if (maybe_value) |v| {
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .scalar = std.fmt.allocPrint(arena, "{f}", .{v}) catch @panic("OOM") },
                 .used = false,
             }) catch @panic("OOM");
         },
         LazyPath => return if (maybe_value) |v| {
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .lazy_path = v.dupeInner(arena) },
                 .used = false,
@@ -474,14 +474,14 @@ fn addUserInputOptionFromArg(
         []const LazyPath => return if (maybe_value) |v| {
             var list = std.array_list.Managed(LazyPath).initCapacity(arena, v.len) catch @panic("OOM");
             for (v) |lp| list.appendAssumeCapacity(lp.dupeInner(arena));
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .lazy_path_list = list },
                 .used = false,
             }) catch @panic("OOM");
         },
         []const u8 => return if (maybe_value) |v| {
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .scalar = arena.dupe(u8, v) catch @panic("OOM") },
                 .used = false,
@@ -490,7 +490,7 @@ fn addUserInputOptionFromArg(
         []const []const u8 => return if (maybe_value) |v| {
             var list = std.array_list.Managed([]const u8).initCapacity(arena, v.len) catch @panic("OOM");
             for (v) |s| list.appendAssumeCapacity(arena.dupe(u8, s) catch @panic("OOM"));
-            map.put(field.name, .{
+            map.put(arena, field.name, .{
                 .name = field.name,
                 .value = .{ .list = list },
                 .used = false,
@@ -498,28 +498,28 @@ fn addUserInputOptionFromArg(
         },
         else => switch (@typeInfo(T)) {
             .bool => return if (maybe_value) |v| {
-                map.put(field.name, .{
+                map.put(arena, field.name, .{
                     .name = field.name,
                     .value = .{ .scalar = if (v) "true" else "false" },
                     .used = false,
                 }) catch @panic("OOM");
             },
             .@"enum", .enum_literal => return if (maybe_value) |v| {
-                map.put(field.name, .{
+                map.put(arena, field.name, .{
                     .name = field.name,
                     .value = .{ .scalar = @tagName(v) },
                     .used = false,
                 }) catch @panic("OOM");
             },
             .comptime_int, .int => return if (maybe_value) |v| {
-                map.put(field.name, .{
+                map.put(arena, field.name, .{
                     .name = field.name,
                     .value = .{ .scalar = std.fmt.allocPrint(arena, "{d}", .{v}) catch @panic("OOM") },
                     .used = false,
                 }) catch @panic("OOM");
             },
             .comptime_float, .float => return if (maybe_value) |v| {
-                map.put(field.name, .{
+                map.put(arena, field.name, .{
                     .name = field.name,
                     .value = .{ .scalar = std.fmt.allocPrint(arena, "{x}", .{v}) catch @panic("OOM") },
                     .used = false,
@@ -543,7 +543,7 @@ fn addUserInputOptionFromArg(
                     .@"enum" => return if (maybe_value) |v| {
                         var list = std.array_list.Managed([]const u8).initCapacity(arena, v.len) catch @panic("OOM");
                         for (v) |tag| list.appendAssumeCapacity(@tagName(tag));
-                        map.put(field.name, .{
+                        map.put(arena, field.name, .{
                             .name = field.name,
                             .value = .{ .list = list },
                             .used = false,
@@ -638,7 +638,7 @@ const OrderedUserValue = union(enum) {
         }
     }
 
-    fn mapFromUnordered(allocator: Allocator, unordered: std.StringHashMap(*const UserValue)) std.array_list.Managed(Pair) {
+    fn mapFromUnordered(allocator: Allocator, unordered: std.hash_map.String(*const UserValue)) std.array_list.Managed(Pair) {
         var ordered = std.array_list.Managed(Pair).init(allocator);
         var it = unordered.iterator();
         while (it.next()) |entry| {
@@ -1156,7 +1156,7 @@ pub fn option(b: *Build, comptime T: type, name_raw: []const u8, description_raw
         .description = description,
         .enum_options = enum_options,
     };
-    if ((b.available_options_map.fetchPut(name, available_option) catch @panic("OOM")) != null) {
+    if ((b.available_options_map.fetchPut(b.allocator, name, available_option) catch @panic("OOM")) != null) {
         panic("Option '{s}' declared twice", .{name});
     }
     b.available_options_list.append(available_option) catch @panic("OOM");
@@ -1530,7 +1530,7 @@ pub fn standardTargetOptionsQueryOnly(b: *Build, args: StandardTargetOptionsArgs
 pub fn addUserInputOption(b: *Build, name_raw: []const u8, value_raw: []const u8) error{OutOfMemory}!bool {
     const name = b.dupe(name_raw);
     const value = b.dupe(value_raw);
-    const gop = try b.user_input_options.getOrPut(name);
+    const gop = try b.user_input_options.getOrPut(b.allocator, name);
     if (!gop.found_existing) {
         gop.value_ptr.* = UserInputOption{
             .name = name,
@@ -1547,7 +1547,7 @@ pub fn addUserInputOption(b: *Build, name_raw: []const u8, value_raw: []const u8
             var list = std.array_list.Managed([]const u8).init(b.allocator);
             try list.append(s);
             try list.append(value);
-            try b.user_input_options.put(name, .{
+            try b.user_input_options.put(b.allocator, name, .{
                 .name = name,
                 .value = .{ .list = list },
                 .used = false,
@@ -1556,7 +1556,7 @@ pub fn addUserInputOption(b: *Build, name_raw: []const u8, value_raw: []const u8
         .list => |*list| {
             // append to the list
             try list.append(value);
-            try b.user_input_options.put(name, .{
+            try b.user_input_options.put(b.allocator, name, .{
                 .name = name,
                 .value = .{ .list = list.* },
                 .used = false,
@@ -1581,7 +1581,7 @@ pub fn addUserInputOption(b: *Build, name_raw: []const u8, value_raw: []const u8
 
 pub fn addUserInputFlag(b: *Build, name_raw: []const u8) error{OutOfMemory}!bool {
     const name = b.dupe(name_raw);
-    const gop = try b.user_input_options.getOrPut(name);
+    const gop = try b.user_input_options.getOrPut(b.allocator, name);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{
             .name = name,

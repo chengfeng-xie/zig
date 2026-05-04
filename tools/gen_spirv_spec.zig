@@ -11,7 +11,7 @@ const OperandKind = g.OperandKind;
 const Enumerant = g.Enumerant;
 const Operand = g.Operand;
 
-const ExtendedStructSet = std.StringHashMap(void);
+const ExtendedStructSet = std.hash_map.String(void);
 
 const Extension = struct {
     name: []const u8,
@@ -154,8 +154,8 @@ fn readRegistry(io: Io, arena: Allocator, comptime RegistryType: type, dir: Io.D
 /// Returns a set with types that require an extra struct for the `Instruction` interface
 /// to the spir-v spec, or whether the original type can be used.
 fn extendedStructs(arena: Allocator, kinds: []const OperandKind) !ExtendedStructSet {
-    var map = ExtendedStructSet.init(arena);
-    try map.ensureTotalCapacity(@as(u32, @intCast(kinds.len)));
+    var map: ExtendedStructSet = .empty;
+    try map.ensureTotalCapacity(arena, @as(u32, @intCast(kinds.len)));
 
     for (kinds) |kind| {
         const enumerants = kind.enumerants orelse continue;

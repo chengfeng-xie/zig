@@ -2022,7 +2022,7 @@ fn processOneTargetInner(io: Io, job: Job) !void {
     const progress_node = job.root_progress.start(target.zig_name, 3);
     defer progress_node.end();
 
-    var features_table = std.StringHashMap(Feature).init(arena);
+    var features_table: std.hash_map.String(Feature) = .empty;
     var all_features = std.array_list.Managed(Feature).init(arena);
     var all_cpus = std.array_list.Managed(Cpu).init(arena);
 
@@ -2084,7 +2084,7 @@ fn processOneTargetInner(io: Io, job: Job) !void {
             llvm: []const u8,
             zig: []const u8,
         };
-        var cpu_aliases = std.StringHashMap(std.ArrayList(*Alias)).init(arena);
+        var cpu_aliases: std.hash_map.String(std.ArrayList(*Alias)) = .empty;
 
         {
             var it = root_map.iterator();
@@ -2098,7 +2098,7 @@ fn processOneTargetInner(io: Io, job: Job) !void {
                     const llvm_alias = kv.value_ptr.object.get("Name").?.string;
                     const llvm_name = kv.value_ptr.object.get("Alias").?.string;
 
-                    const gop = try cpu_aliases.getOrPut(try llvmNameToZigName(arena, llvm_name));
+                    const gop = try cpu_aliases.getOrPut(arena, try llvmNameToZigName(arena, llvm_name));
 
                     if (!gop.found_existing) {
                         gop.value_ptr.* = .empty;
@@ -2196,7 +2196,7 @@ fn processOneTargetInner(io: Io, job: Job) !void {
                         .deps = deps.items,
                         .flatten = flatten,
                     };
-                    try features_table.put(zig_name, feature);
+                    try features_table.put(arena, zig_name, feature);
                     if (!omit and !flatten) {
                         try all_features.append(feature);
                     }
@@ -2286,7 +2286,7 @@ fn processOneTargetInner(io: Io, job: Job) !void {
     }
 
     for (target.extra_features) |extra_feature| {
-        try features_table.put(extra_feature.zig_name, extra_feature);
+        try features_table.put(arena, extra_feature.zig_name, extra_feature);
         try all_features.append(extra_feature);
     }
     for (target.extra_cpus) |extra_cpu| {
@@ -2372,9 +2372,9 @@ fn processOneTargetInner(io: Io, job: Job) !void {
                 },
             );
         }
-        var deps_set = std.StringHashMap(void).init(arena);
+        var deps_set: std.hash_map.String(void) = .empty;
         for (feature.deps) |dep| {
-            try putDep(&deps_set, features_table, dep);
+            try putDep(arena, &deps_set, features_table, dep);
         }
         try pruneFeatures(arena, features_table, &deps_set);
         var dependencies = std.array_list.Managed([]const u8).init(arena);
@@ -2417,9 +2417,9 @@ fn processOneTargetInner(io: Io, job: Job) !void {
         \\
     );
     for (all_cpus.items) |cpu| {
-        var deps_set = std.StringHashMap(void).init(arena);
+        var deps_set: std.hash_map.String(void) = .empty;
         for (cpu.features) |feature_zig_name| {
-            try putDep(&deps_set, features_table, feature_zig_name);
+            try putDep(arena, &deps_set, features_table, feature_zig_name);
         }
         try pruneFeatures(arena, features_table, &deps_set);
         var cpu_features = std.array_list.Managed([]const u8).init(arena);
@@ -2542,18 +2542,18 @@ fn hasSuperclass(obj: *const json.ObjectMap, class_name: []const u8) bool {
 
 fn pruneFeatures(
     arena: mem.Allocator,
-    features_table: std.StringHashMap(Feature),
-    deps_set: *std.StringHashMap(void),
+    features_table: std.hash_map.String(Feature),
+    deps_set: *std.hash_map.String(void),
 ) !void {
     // For each element, recursively iterate over the dependencies and add
     // everything we find to a "deletion set".
     // Then, iterate over the deletion set and delete all that stuff from `deps_set`.
-    var deletion_set = std.StringHashMap(void).init(arena);
+    var deletion_set: std.hash_map.String(void) = .empty;
     {
         var it = deps_set.keyIterator();
         while (it.next()) |key| {
             const feature = features_table.get(key.*).?;
-            try walkFeatures(features_table, &deletion_set, feature);
+            try walkFeatures(arena, features_table, &deletion_set, feature);
         }
     }
     {
@@ -2565,28 +2565,30 @@ fn pruneFeatures(
 }
 
 fn walkFeatures(
-    features_table: std.StringHashMap(Feature),
-    deletion_set: *std.StringHashMap(void),
+    arena: mem.Allocator,
+    features_table: std.hash_map.String(Feature),
+    deletion_set: *std.hash_map.String(void),
     feature: Feature,
 ) error{OutOfMemory}!void {
     for (feature.deps) |dep| {
-        try deletion_set.put(dep, {});
+        try deletion_set.put(arena, dep, {});
         const other_feature = features_table.get(dep).?;
-        try walkFeatures(features_table, deletion_set, other_feature);
+        try walkFeatures(arena, features_table, deletion_set, other_feature);
     }
 }
 
 fn putDep(
-    deps_set: *std.StringHashMap(void),
-    features_table: std.StringHashMap(Feature),
+    arena: mem.Allocator,
+    deps_set: *std.hash_map.String(void),
+    features_table: std.hash_map.String(Feature),
     zig_feature_name: []const u8,
 ) error{OutOfMemory}!void {
     const feature = features_table.get(zig_feature_name).?;
     if (feature.flatten) {
         for (feature.deps) |dep| {
-            try putDep(deps_set, features_table, dep);
+            try putDep(arena, deps_set, features_table, dep);
         }
     } else {
-        try deps_set.put(zig_feature_name, {});
+        try deps_set.put(arena, zig_feature_name, {});
     }
 }

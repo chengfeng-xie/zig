@@ -658,7 +658,7 @@ pub fn main(init: std.process.Init) !void {
     const llvm_src_root = args[2];
     if (std.mem.startsWith(u8, llvm_src_root, "-")) printUsageAndExit(args[0]);
 
-    var llvm_to_zig_cpu_features = std.StringHashMap([]const u8).init(arena);
+    var llvm_to_zig_cpu_features: std.hash_map.String([]const u8) = .empty;
 
     inline for (@typeInfo(cpu_targets).@"struct".decls) |decl| {
         const Feature = @field(cpu_targets, decl.name).Feature;
@@ -668,7 +668,7 @@ pub fn main(init: std.process.Init) !void {
             const llvm_name = feat.llvm_name orelse continue;
             const zig_feat = @as(Feature, @enumFromInt(i));
             const zig_name = @tagName(zig_feat);
-            try llvm_to_zig_cpu_features.put(llvm_name, zig_name);
+            try llvm_to_zig_cpu_features.put(arena, llvm_name, zig_name);
         }
     }
 

@@ -128,9 +128,9 @@ const Contents = struct {
     }
 };
 
-const HashToContents = std.StringHashMap(Contents);
+const HashToContents = std.hash_map.String(Contents);
 const TargetToHash = std.array_hash_map.String([]const u8);
-const PathTable = std.StringHashMap(*TargetToHash);
+const PathTable = std.array_hash_map.String(*TargetToHash);
 
 const LibCVendor = enum {
     musl,
@@ -192,8 +192,8 @@ pub fn main(init: std.process.Init) !void {
         .openbsd => &openbsd_targets,
     };
 
-    var path_table = PathTable.init(arena);
-    var hash_to_contents = HashToContents.init(arena);
+    var path_table: PathTable = .empty;
+    var hash_to_contents: HashToContents = .empty;
     var max_bytes_saved: usize = 0;
     var total_bytes: usize = 0;
 
@@ -298,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
                             hasher.update(rel_path);
                             hasher.update(trimmed);
                             hasher.final(hash);
-                            const gop = try hash_to_contents.getOrPut(hash);
+                            const gop = try hash_to_contents.getOrPut(arena, hash);
                             if (gop.found_existing) {
                                 max_bytes_saved += raw_bytes.len;
                                 gop.value_ptr.hit_count += 1;
@@ -313,7 +313,7 @@ pub fn main(init: std.process.Init) !void {
                                     .is_generic = false,
                                 };
                             }
-                            const path_gop = try path_table.getOrPut(rel_path);
+                            const path_gop = try path_table.getOrPut(arena, rel_path);
                             const target_to_hash = if (path_gop.found_existing) path_gop.value_ptr.* else blk: {
                                 const ptr = try arena.create(TargetToHash);
                                 ptr.* = .empty;
@@ -361,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
         {
             var hash_it = path_kv.value_ptr.*.iterator();
             while (hash_it.next()) |hash_kv| {
-                const contents = hash_to_contents.getPtr(hash_kv.value_ptr.*).?;
+                const contents = hash_to_contents.getPtr(arena, hash_kv.value_ptr.*).?;
                 try contents_list.append(contents);
             }
         }

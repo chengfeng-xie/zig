@@ -177157,9 +177157,9 @@ fn airAsm(self: *CodeGen, inst: Air.Inst.Index) !void {
         });
         args.deinit();
     }
-    var arg_map: std.StringHashMap(u8) = .init(self.gpa);
-    try arg_map.ensureTotalCapacity(@intCast(outputs.len + inputs.len));
-    defer arg_map.deinit();
+    var arg_map: std.hash_map.String(u8) = .empty;
+    try arg_map.ensureTotalCapacity(self.gpa, @intCast(outputs.len + inputs.len));
+    defer arg_map.deinit(self.gpa);
 
     var it = unwrapped_asm.iterateOutputs();
     while (it.next()) |out| {

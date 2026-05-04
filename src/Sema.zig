@@ -3432,8 +3432,8 @@ fn resolveComptimeKnownAllocPtr(sema: *Sema, block: *Block, alloc: Air.Inst.Ref,
     } });
 
     // Maps from pointers into the runtime allocs, to comptime-mutable pointers into the comptime alloc
-    var ptr_mapping = std.AutoHashMap(Air.Inst.Index, InternPool.Index).init(sema.arena);
-    try ptr_mapping.ensureTotalCapacity(@intCast(stores.len));
+    var ptr_mapping: std.hash_map.Auto(Air.Inst.Index, InternPool.Index) = .empty;
+    try ptr_mapping.ensureTotalCapacity(sema.arena, @intCast(stores.len));
     ptr_mapping.putAssumeCapacity(alloc_inst, alloc_ptr);
 
     // Whilst constructing our mapping, we will also initialize optional and error union payloads when
@@ -3585,7 +3585,7 @@ fn resolveComptimeKnownAllocPtr(sema: *Sema, block: *Block, alloc: Air.Inst.Ref,
                 break :ptr (try parent_ptr_val.ptrElem(idx, pt)).toIntern();
             },
         };
-        try ptr_mapping.put(air_ptr, new_ptr);
+        try ptr_mapping.put(sema.arena, air_ptr, new_ptr);
     }
 
     // We have a correlation between AIR pointers and decl pointers. Perform all stores at comptime.
@@ -16769,8 +16769,8 @@ fn typeInfoDecls(
     var decl_vals = std.array_list.Managed(InternPool.Index).init(gpa);
     defer decl_vals.deinit();
 
-    var seen_namespaces = std.AutoHashMap(*Namespace, void).init(gpa);
-    defer seen_namespaces.deinit();
+    var seen_namespaces: std.hash_map.Auto(*Namespace, void) = .empty;
+    defer seen_namespaces.deinit(gpa);
 
     try sema.typeInfoNamespaceDecls(opt_namespace, declaration_ty, &decl_vals, &seen_namespaces);
 
@@ -16806,7 +16806,7 @@ fn typeInfoNamespaceDecls(
     opt_namespace_index: InternPool.OptionalNamespaceIndex,
     declaration_ty: Type,
     decl_vals: *std.array_list.Managed(InternPool.Index),
-    seen_namespaces: *std.AutoHashMap(*Namespace, void),
+    seen_namespaces: *std.hash_map.Auto(*Namespace, void),
 ) !void {
     const pt = sema.pt;
     const zcu = pt.zcu;
@@ -16816,7 +16816,7 @@ fn typeInfoNamespaceDecls(
     try pt.ensureNamespaceUpToDate(namespace_index);
     const namespace = zcu.namespacePtr(namespace_index);
 
-    const gop = try seen_namespaces.getOrPut(namespace);
+    const gop = try seen_namespaces.getOrPut(sema.gpa, namespace);
     if (gop.found_existing) return;
 
     for (namespace.pub_decls.keys()) |nav| {

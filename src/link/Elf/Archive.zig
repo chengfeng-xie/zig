@@ -198,9 +198,9 @@ pub const ArSymtab = struct {
 
         const comp = elf_file.base.comp;
         const gpa = comp.gpa;
-        var offsets = std.AutoHashMap(File.Index, u64).init(gpa);
-        defer offsets.deinit();
-        try offsets.ensureUnusedCapacity(@intCast(elf_file.objects.items.len + 1));
+        var offsets: std.hash_map.Auto(File.Index, u64) = .empty;
+        defer offsets.deinit(gpa);
+        try offsets.ensureUnusedCapacity(gpa, @intCast(elf_file.objects.items.len + 1));
 
         if (elf_file.zigObjectPtr()) |zig_object| {
             offsets.putAssumeCapacityNoClobber(zig_object.index, zig_object.output_ar_state.file_off);

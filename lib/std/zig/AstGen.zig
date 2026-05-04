@@ -65,7 +65,7 @@ scratch: std.ArrayList(u32) = .empty,
 /// 2. `ref` instructions will dominate their uses. This is a required property
 ///    of ZIR.
 /// The key is the ref operand; the value is the ref instruction.
-ref_table: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index) = .empty,
+ref_table: std.hash_map.Auto(Zir.Inst.Index, Zir.Inst.Index) = .empty,
 /// Any information which should trigger invalidation of incremental compilation
 /// data should be used to update this hasher. The result is the final source
 /// hash of the enclosing declaration/etc.
@@ -5673,7 +5673,7 @@ fn errorSetDecl(gz: *GenZir, ri: ResultInfo, node: Ast.Node.Index) InnerError!Zi
     const payload_index = try reserveExtra(astgen, @typeInfo(Zir.Inst.ErrorSetDecl).@"struct".fields.len);
     var fields_len: usize = 0;
     {
-        var idents: std.AutoHashMapUnmanaged(Zir.NullTerminatedString, Ast.TokenIndex) = .empty;
+        var idents: std.hash_map.Auto(Zir.NullTerminatedString, Ast.TokenIndex) = .empty;
         defer idents.deinit(gpa);
 
         const lbrace, const rbrace = tree.nodeData(node).token_and_token;
@@ -11143,7 +11143,7 @@ const Scope = struct {
         parent: *Scope,
         /// Maps string table index to the source location of declaration,
         /// for the purposes of reporting name shadowing compile errors.
-        decls: std.AutoHashMapUnmanaged(Zir.NullTerminatedString, Ast.Node.Index) = .empty,
+        decls: std.hash_map.Auto(Zir.NullTerminatedString, Ast.Node.Index) = .empty,
         node: Ast.Node.Index,
         inst: Zir.Inst.Index,
         maybe_generic: bool,

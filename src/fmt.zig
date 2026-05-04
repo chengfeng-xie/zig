@@ -39,7 +39,7 @@ const Fmt = struct {
     out_buffer: std.Io.Writer.Allocating,
     stdout_writer: *Io.File.Writer,
 
-    const SeenMap = std.AutoHashMap(Io.File.INode, void);
+    const SeenMap = std.hash_map.Auto(Io.File.INode, void);
 };
 
 pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !void {
@@ -168,7 +168,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
         .gpa = gpa,
         .arena = arena,
         .io = io,
-        .seen = .init(gpa),
+        .seen = .empty,
         .any_error = false,
         .check_ast = check_ast_flag,
         .force_zon = force_zon,
@@ -176,7 +176,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
         .out_buffer = .init(gpa),
         .stdout_writer = &stdout_writer,
     };
-    defer fmt.seen.deinit();
+    defer fmt.seen.deinit(gpa);
     defer fmt.out_buffer.deinit();
 
     // Mark any excluded files/directories as already seen,
@@ -192,7 +192,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
             },
             else => |e| return e,
         };
-        try fmt.seen.put(stat.inode, {});
+        try fmt.seen.put(gpa, stat.inode, {});
     }
 
     for (input_files.items) |file_path| {
@@ -228,7 +228,7 @@ fn fmtPathDir(
     defer dir.close(io);
 
     const stat = try dir.stat(io);
-    if (try fmt.seen.fetchPut(stat.inode, {})) |_| return;
+    if (try fmt.seen.fetchPut(fmt.gpa, stat.inode, {})) |_| return;
 
     var dir_it = dir.iterate();
     while (try dir_it.next(io)) |entry| {
@@ -286,7 +286,7 @@ fn fmtPathFile(
     file_closed = true;
 
     // Add to set after no longer possible to get error.IsDir.
-    if (try fmt.seen.fetchPut(stat.inode, {})) |_| return;
+    if (try fmt.seen.fetchPut(fmt.gpa, stat.inode, {})) |_| return;
 
     const mode: std.zig.Ast.Mode = mode: {
         if (fmt.force_zon) break :mode .zon;

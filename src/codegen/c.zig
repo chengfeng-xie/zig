@@ -383,7 +383,7 @@ pub fn isMangledIdent(ident: []const u8, solo: bool) bool {
 pub const Function = struct {
     air: Air,
     liveness: Air.Liveness,
-    value_map: std.AutoHashMap(Air.Inst.Ref, CValue),
+    value_map: std.hash_map.Auto(Air.Inst.Ref, CValue),
     blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, BlockData) = .empty,
     next_arg_index: u32 = 0,
     next_block_index: u32 = 0,
@@ -437,7 +437,7 @@ pub const Function = struct {
     }
 
     fn resolveInst(f: *Function, ref: Air.Inst.Ref) !CValue {
-        const gop = try f.value_map.getOrPut(ref);
+        const gop = try f.value_map.getOrPut(f.dg.gpa, ref);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .constant = .fromInterned(ref.toInterned().?) };
         }
@@ -575,7 +575,7 @@ pub const Function = struct {
         f.locals.deinit(gpa);
         deinitFreeLocalsMap(gpa, &f.free_locals_map);
         f.blocks.deinit(gpa);
-        f.value_map.deinit();
+        f.value_map.deinit(gpa);
         f.need_tag_name_funcs.deinit(gpa);
         f.need_never_tail_funcs.deinit(gpa);
         f.need_never_inline_funcs.deinit(gpa);
@@ -2201,7 +2201,7 @@ pub fn generate(
     defer arena.deinit();
 
     var function: Function = .{
-        .value_map = .init(gpa),
+        .value_map = .empty,
         .air = air.*,
         .liveness = liveness.*.?,
         .func_index = func_index,
@@ -2586,8 +2586,8 @@ fn genBodyResolveState(f: *Function, inst: Air.Inst.Index, leading_deaths: []con
     const gpa = f.dg.gpa;
 
     // Save the original value_map and free_locals_map so that we can restore them after the body.
-    var old_value_map = try f.value_map.clone();
-    defer old_value_map.deinit();
+    var old_value_map = try f.value_map.clone(gpa);
+    defer old_value_map.deinit(gpa);
     var old_free_locals = try cloneFreeLocalsMap(gpa, &f.free_locals_map);
     defer deinitFreeLocalsMap(gpa, &old_free_locals);
 
@@ -2606,7 +2606,7 @@ fn genBodyResolveState(f: *Function, inst: Air.Inst.Index, leading_deaths: []con
         try genBody(f, body);
     }
 
-    f.value_map.deinit();
+    f.value_map.deinit(gpa);
     f.value_map = old_value_map.move();
     deinitFreeLocalsMap(gpa, &f.free_locals_map);
     f.free_locals_map = old_free_locals.move();
@@ -2926,7 +2926,7 @@ fn genBodyInner(f: *Function, body: []const Air.Inst.Index) Error!void {
         if (result_value == .new_local) {
             log.debug("map %{d} to t{d}", .{ inst, result_value.new_local });
         }
-        try f.value_map.putNoClobber(inst.toRef(), switch (result_value) {
+        try f.value_map.putNoClobber(f.dg.gpa, inst.toRef(), switch (result_value) {
             .none => continue,
             .new_local => |local_index| .{ .local = local_index },
             else => result_value,

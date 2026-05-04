@@ -189,7 +189,7 @@ entry: Entry = .default,
 /// List of symbols forced as undefined in the symbol table
 /// thus forcing their resolution by the linker.
 /// Corresponds to `-u <symbol>` for ELF/MachO and `/include:<symbol>` for COFF/PE.
-force_undefined_symbols: std.StringHashMap(void),
+force_undefined_symbols: std.hash_map.String(void),
 
 /// Overrides the default stack size
 stack_size: ?u64 = null,
@@ -436,7 +436,7 @@ pub fn create(owner: *std.Build, options: Options) *Compile {
         .test_runner = null, // set below
         .rdynamic = false,
         .installed_path = null,
-        .force_undefined_symbols = StringHashMap(void).init(owner.allocator),
+        .force_undefined_symbols = .empty,
 
         .emit_directory = null,
         .generated_docs = null,
@@ -625,7 +625,7 @@ pub fn setVersionScript(compile: *Compile, source: LazyPath) void {
 
 pub fn forceUndefinedSymbol(compile: *Compile, symbol_name: []const u8) void {
     const b = compile.step.owner;
-    compile.force_undefined_symbols.put(b.dupe(symbol_name), {}) catch @panic("OOM");
+    compile.force_undefined_symbols.put(b.allocator, b.dupe(symbol_name), {}) catch @panic("OOM");
 }
 
 /// Returns whether the library, executable, or object depends on a particular system library.

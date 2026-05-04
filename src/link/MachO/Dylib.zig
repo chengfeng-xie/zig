@@ -265,8 +265,8 @@ fn parseTbd(self: *Dylib, macho_file: *MachO) !void {
         self.id = id;
     }
 
-    var umbrella_libs = std.StringHashMap(void).init(gpa);
-    defer umbrella_libs.deinit();
+    var umbrella_libs: std.hash_map.String(void) = .empty;
+    defer umbrella_libs.deinit(gpa);
 
     log.debug("  (install_name '{s}')", .{umbrella_lib.installName()});
 
@@ -283,7 +283,7 @@ fn parseTbd(self: *Dylib, macho_file: *MachO) !void {
             // TODO I thought that we could switch on presence of `parent-umbrella` map;
             // however, turns out `libsystem_notify.dylib` is fully reexported by `libSystem.dylib`
             // BUT does not feature a `parent-umbrella` map as the only sublib. Apple's bug perhaps?
-            try umbrella_libs.put(elem.installName(), {});
+            try umbrella_libs.put(gpa, elem.installName(), {});
         }
 
         switch (elem) {

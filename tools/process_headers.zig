@@ -361,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
         {
             var hash_it = path_kv.value_ptr.*.iterator();
             while (hash_it.next()) |hash_kv| {
-                const contents = hash_to_contents.getPtr(arena, hash_kv.value_ptr.*).?;
+                const contents = hash_to_contents.getPtr(hash_kv.value_ptr.*).?;
                 try contents_list.append(contents);
             }
         }

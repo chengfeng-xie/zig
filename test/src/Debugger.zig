@@ -1901,12 +1901,12 @@ pub fn addTestsForTarget(db: *Debugger, target: *const Target) void {
         },
         \\breakpoint set --file main.zig --source-pattern-regexp '_ = map;'
         \\process launch
-        \\frame variable --show-types -- map.unmanaged
+        \\frame variable --show-types -- map
         \\breakpoint delete --force 1
     ,
         &.{
-            \\(lldb) frame variable --show-types -- map.unmanaged
-            \\(std.hash_map.Custom(u32,u32,main.Context,63)) map.unmanaged = len=5 capacity=16 {
+            \\(lldb) frame variable --show-types -- map
+            \\(std.hash_map.Custom(u32,u32,main.Context,63)) map = len=5 capacity=16 {
             \\  (std.hash_map.Custom(u32,u32,main.Context,63).KV) [0] = {
             \\    (u32) .key = 0
             \\    (u32) .value = 1

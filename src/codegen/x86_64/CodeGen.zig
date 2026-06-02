@@ -182782,7 +182782,7 @@ const Temp = struct {
                         break :part_ty .usize;
                     },
                 },
-                .struct_type => {
+                .struct_type, .union_type => {
                     assert(src_regs.len - part_index == std.math.divCeil(u32, src_abi_size, 8) catch unreachable);
                     break :part_ty switch (src_abi_size) {
                         0, 3, 5...7 => unreachable,

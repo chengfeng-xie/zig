@@ -67565,7 +67565,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(32, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .false_deps_lzcnt_tzcnt, .lzcnt, null, null },
+                    .required_features = .{ .false_deps_lzcnt, .lzcnt, null, null },
                     .src_constraints = .{ .{ .exact_int = 16 }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -67601,7 +67601,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(16, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .false_deps_lzcnt_tzcnt, .lzcnt, null, null },
+                    .required_features = .{ .false_deps_lzcnt, .lzcnt, null, null },
                     .src_constraints = .{ .{ .unsigned_int = .word }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -67626,7 +67626,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(16, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .false_deps_lzcnt_tzcnt, .lzcnt, null, null },
+                    .required_features = .{ .false_deps_lzcnt, .lzcnt, null, null },
                     .src_constraints = .{ .{ .exact_int = 32 }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -67662,7 +67662,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(32, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .false_deps_lzcnt_tzcnt, .lzcnt, null, null },
+                    .required_features = .{ .false_deps_lzcnt, .lzcnt, null, null },
                     .src_constraints = .{ .{ .unsigned_int = .dword }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -67687,7 +67687,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(32, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .exact_int = 64 }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -67725,7 +67725,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .sia(64, .src0, .sub_bit_size), ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .unsigned_int = .qword }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mut_gpr, .none, .none } },
@@ -68582,7 +68582,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .sub, .dst0b, .tmp0b, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .unsigned_or_exact_remainder_int = .{ .of = .xword, .is = .qword } }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mem, .none, .none } },
@@ -68710,7 +68710,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .neg, .dst0d, ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .unsigned_or_exact_remainder_int = .{ .of = .xword, .is = .xword } }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mem, .none, .none } },
@@ -68838,7 +68838,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .neg, .dst0d, ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .remainder_int = .{ .of = .xword, .is = .qword } }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mem, .none, .none } },
@@ -68941,7 +68941,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .neg, .dst0d, ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .remainder_int = .{ .of = .xword, .is = .xword } }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mem, .none, .none } },
@@ -70097,7 +70097,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nz, .j, .@"0b", ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .scalar_remainder_int = .{ .of = .xword, .is = .qword } }, .any, .any },
                     .dst_constraints = .{ .{ .scalar_int_is = .byte }, .any },
                     .patterns = &.{
@@ -70221,7 +70221,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .scalar_remainder_int = .{ .of = .xword, .is = .xword } }, .any, .any },
                     .dst_constraints = .{ .{ .scalar_int_is = .byte }, .any },
                     .patterns = &.{
@@ -70345,7 +70345,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .scalar_remainder_int = .{ .of = .xword, .is = .qword } }, .any, .any },
                     .dst_constraints = .{ .{ .scalar_int_is = .word }, .any },
                     .patterns = &.{
@@ -70469,7 +70469,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._nc, .j, .@"0b", ._, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .false_deps_lzcnt_tzcnt, .lzcnt, null },
+                    .required_features = .{ .@"64bit", .false_deps_lzcnt, .lzcnt, null },
                     .src_constraints = .{ .{ .scalar_remainder_int = .{ .of = .xword, .is = .xword } }, .any, .any },
                     .dst_constraints = .{ .{ .scalar_int_is = .word }, .any },
                     .patterns = &.{
@@ -70654,7 +70654,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .tzcnt, .dst0w, .src0w, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .bmi, .false_deps_lzcnt_tzcnt, null, null },
+                    .required_features = .{ .bmi, .false_deps_tzcnt, null, null },
                     .src_constraints = .{ .{ .exact_int = 32 }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .mem, .none, .none } },
@@ -70691,7 +70691,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._, .tzcnt, .dst0d, .src0d, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .bmi, .false_deps_lzcnt_tzcnt, null },
+                    .required_features = .{ .@"64bit", .bmi, .false_deps_tzcnt, null },
                     .src_constraints = .{ .{ .exact_int = 64 }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .mem, .none, .none } },
@@ -70868,7 +70868,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                         .{ ._, ._f, .bs, .dst0q, .src0q, ._, ._ },
                     } },
                 }, .{
-                    .required_features = .{ .@"64bit", .bmi, .false_deps_lzcnt_tzcnt, null },
+                    .required_features = .{ .@"64bit", .bmi, .false_deps_tzcnt, null },
                     .src_constraints = .{ .{ .remainder_int = .{ .of = .qword, .is = .qword } }, .any, .any },
                     .patterns = &.{
                         .{ .src = .{ .to_mem, .none, .none } },
@@ -182373,12 +182373,13 @@ fn hasFeature(cg: *CodeGen, feature: std.Target.x86.Feature) bool {
             .x86_64 => true,
         },
         .false_deps_getmant,
-        .false_deps_lzcnt_tzcnt,
+        .false_deps_lzcnt,
         .false_deps_mulc,
         .false_deps_mullq,
         .false_deps_perm,
         .false_deps_popcnt,
         .false_deps_range,
+        .false_deps_tzcnt,
         .slow_3ops_lea,
         .slow_incdec,
         .slow_lea,

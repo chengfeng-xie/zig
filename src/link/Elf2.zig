@@ -3574,6 +3574,7 @@ fn initHeaders(
         interp: u32,
         rodata: u32,
         text: u32,
+        /// HACKHACK: must be assigned after all other loadable segments so that the data segment always has the greatest vaddr on SPARC
         data: u32,
         /// On most targets this is `undefined`, but on machines where JUMP_SLOT relocations write
         /// directly to the PLT, we place the PLT in its own segment in order to avoid making the
@@ -3606,14 +3607,14 @@ fn initHeaders(
                 defer phnum += 1;
                 break :phndx phnum;
             },
-            .data = phndx: {
-                defer phnum += 1;
-                break :phndx phnum;
-            },
             .plt = if (plt.got_plt == null) phndx: {
                 defer phnum += 1;
                 break :phndx phnum;
             } else undefined,
+            .data = phndx: {
+                defer phnum += 1;
+                break :phndx phnum;
+            },
             .tls = if (comp.config.any_non_single_threaded) phndx: {
                 defer phnum += 1;
                 break :phndx phnum;
@@ -8355,6 +8356,19 @@ fn allocateSegmentLoadAddress(elf: *Elf, orig_phndx: u32) std.mem.Allocator.Erro
                 const target_size = if (vaddr == orig_vaddr) size else size * 4;
                 if (vaddr + target_size <= next_page_vaddr) {
                     break; // hooray, we fit here!
+                }
+
+                if (elf.phdrs.items[next_phndx] == elf.ni.data.toOptional()) {
+                    // HACKHACK: make sparc happy by keeping the data segment at the end
+                    // so, use the current candidate `vaddr` and just move the data segment's vaddr out of the way
+                    const next_ni = elf.phdrs.items[next_phndx].unwrap().?;
+                    const next_align = page_align.max(next_ni.alignment(&elf.mf));
+                    const next_offset = elf.targetLoad(&next_ph.offset);
+                    const next_new_vaddr = next_align.forward(vaddr + target_size) + next_offset % next_align.toByteUnits();
+                    elf.targetStore(&next_ph.vaddr, @intCast(next_new_vaddr));
+                    elf.targetStore(&next_ph.paddr, @intCast(next_new_vaddr));
+                    try next_ni.childrenMoved(elf.base.comp.gpa, &elf.mf);
+                    break;
                 }
 
                 // We don't fit here, so shift ourselves forward (i.e. swap with `next_phndx`). But

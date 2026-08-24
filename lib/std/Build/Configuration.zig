@@ -1872,12 +1872,11 @@ pub const PathDep = extern struct {
     pkg: Package.OptionalIndex,
 
     pub const Flags = packed struct(u32) {
-        mode: Mode,
+        is_directory: bool,
+        metadata_only: bool,
         base: LazyPath.Relative.Base,
         _: u16 = 0,
     };
-
-    pub const Mode = enum(u8) { directory, contents, metadata };
 };
 
 pub const InstallDestDir = enum(u32) {

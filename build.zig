@@ -263,8 +263,8 @@ pub fn build(b: *std.Build) !void {
     const opt_version_string = b.option([]const u8, "version-string", "Override Zig version string. Default is to find out with git.");
     const version_slice = if (opt_version_string) |version| version else v: {
         if (!std.process.can_spawn) {
-            std.debug.print("error: version info cannot be retrieved from git. Zig version must be provided using -Dversion-string\n", .{});
-            std.process.exit(1);
+            std.log.info("version info can be provided explicitly via \"-Dversion-string\"", .{});
+            std.process.fatal("version info cannot be retrieved from git", .{});
         }
 
         // Ensure git version changes get picked up.
@@ -310,8 +310,9 @@ pub fn build(b: *std.Build) !void {
             0 => {
                 // Tagged release version (e.g. 0.10.0).
                 if (!mem.eql(u8, git_describe, version_string)) {
-                    std.debug.print("Zig version '{s}' does not match Git tag '{s}'\n", .{ version_string, git_describe });
-                    std.process.exit(1);
+                    std.process.fatal("zig version {q} does not match Git tag {q}", .{
+                        version_string, git_describe,
+                    });
                 }
                 break :v version_string;
             },
@@ -324,13 +325,14 @@ pub fn build(b: *std.Build) !void {
 
                 const ancestor_ver = try std.SemanticVersion.parse(tagged_ancestor);
                 if (zig_version.order(ancestor_ver) != .gt) {
-                    std.debug.print("Zig version '{f}' must be greater than tagged ancestor '{f}'\n", .{ zig_version, ancestor_ver });
-                    std.process.exit(1);
+                    std.process.fatal("zig version {f} must be greater than tagged ancestor {qf}", .{
+                        zig_version, ancestor_ver,
+                    });
                 }
 
                 // Check that the commit hash is prefixed with a 'g' (a Git convention).
                 if (commit_id.len < 1 or commit_id[0] != 'g') {
-                    std.debug.print("Unexpected `git describe` output: {s}\n", .{git_describe});
+                    std.log.warn("unexpected \"git describe\" output: {s}", .{git_describe});
                     break :v version_string;
                 }
 
@@ -338,7 +340,7 @@ pub fn build(b: *std.Build) !void {
                 break :v b.fmt("{s}-dev.{s}+{s}", .{ version_string, commit_height, commit_id[1..] });
             },
             else => {
-                std.debug.print("Unexpected `git describe` output: {s}\n", .{git_describe});
+                std.log.warn("unexpected \"git describe\" output: {s}", .{git_describe});
                 break :v version_string;
             },
         }
@@ -354,7 +356,8 @@ pub fn build(b: *std.Build) !void {
                 const file_contents = cwd.readFileAlloc(io, config_h_path, arena, .limited(max_config_h_bytes)) catch unreachable;
                 break :blk parseConfigH(b, file_contents);
             } else {
-                std.log.warn("config.h could not be located automatically. Consider providing it explicitly via \"-Dconfig_h\"", .{});
+                std.log.warn("config.h could not be located automatically", .{});
+                std.log.info("config.h can be provided explicitly via \"-Dconfig_h\"", .{});
                 break :blk null;
             }
         };

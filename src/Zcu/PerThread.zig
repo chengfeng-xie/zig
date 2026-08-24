@@ -348,11 +348,8 @@ pub fn update(
     }
 }
 fn workerUpdateBuiltinFile(comp: *Compilation, file: *Zcu.File) void {
-    Builtin.updateFileOnDisk(file, comp) catch |err| comp.lockAndSetMiscFailure(
-        .write_builtin_zig,
-        "unable to write '{f}': {s}",
-        .{ file.path.fmt(comp), @errorName(err) },
-    );
+    Builtin.updateFileOnDisk(file, comp) catch |err|
+        comp.lockAndSetMiscFailure(.write_builtin_zig, "unable to write {qf}: {t}", .{ file.path.fmt(comp), err });
 }
 fn workerUpdateFile(
     comp: *Compilation,
@@ -371,7 +368,9 @@ fn workerUpdateFile(
     const active = comp.zcu.?.activate(tid);
     defer active.deactivate();
     active.pt.updateFile(file_index, file) catch |err| {
-        active.pt.reportRetryableFileError(file_index, "unable to load '{s}': {s}", .{ std.fs.path.basename(file.path.sub_path), @errorName(err) }) catch |oom| switch (oom) {
+        active.pt.reportRetryableFileError(file_index, "unable to load {q}: {t}", .{
+            std.fs.path.basename(file.path.sub_path), err,
+        }) catch |oom| switch (oom) {
             error.OutOfMemory => {
                 comp.mutex.lockUncancelable(io);
                 defer comp.mutex.unlock(io);

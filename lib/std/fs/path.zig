@@ -1178,6 +1178,13 @@ pub fn resolvePosix(gpa: Allocator, paths: []const []const u8) Allocator.Error![
     }
 }
 
+pub fn resolvePosix2(gpa: Allocator, al: *std.ArrayList(u8), paths: []const []const u8) Allocator.Error!void {
+    _ = gpa;
+    _ = al;
+    _ = paths;
+    @panic("TODO");
+}
+
 test resolve {
     try testResolveWindows(&[_][]const u8{ "a", "..\\..\\.." }, "..\\..");
     try testResolveWindows(&[_][]const u8{ "..", "", "..\\..\\foo" }, "..\\..\\..\\foo");

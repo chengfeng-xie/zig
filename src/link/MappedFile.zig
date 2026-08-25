@@ -1544,25 +1544,6 @@ fn growNodeViaInsertRange(
     // We don't compute the size of the range yet, because depending on `grow_mode` we might want to
     // bump it based on our sibling and parent nodes' alignments. However, we can do an early check
     // for cases where we should obviously exit.
-    const requested_range_size = new_size - old_size;
-    if (!mf.flags.block_size.check(requested_range_size)) {
-        // The requested size isn't exactly aligned.
-        switch (grow_mode) {
-            .exact => return false,
-            .minimum => {
-                // We can still choose to allow it by increasing the size a bit, but we shouldn't do
-                // that if it would *significantly* increase the requested size.
-                const block_size = mf.flags.block_size.toByteUnits();
-                if (requested_range_size < block_size * 2) {
-                    // Bumping this size up to the next block boundary would be a quite significant
-                    // increase; let's not do it.
-                    return false;
-                }
-            },
-        }
-    }
-    // If `grow_mode` is exact, we will use exactly this size, but if it is `.minimum`, we may bump
-    // the size a little more.
     const min_range_size: u64 = s: {
         const exact_size = new_size - old_size;
         if (mf.flags.block_size.check(exact_size)) {
@@ -1649,16 +1630,16 @@ fn growNodeViaInsertRange(
         }
         // Traversal done. We didn't hit `max_moved_nodes`, so now we can use the computed alignment
         // requirement to figure out whether we're actually going to insert a range.
-        if (need_range_align.check(requested_range_size)) {
-            break :range_size requested_range_size;
+        if (need_range_align.check(min_range_size)) {
+            break :range_size min_range_size;
         }
-        // Perhaps we're allowed to grow by more than `requested_range_size`?
+        // Perhaps we're allowed to grow by more than `min_range_size`?
         switch (grow_mode) {
             .exact => return false,
             .minimum => {
                 const candidate_range_size = need_range_align.forward(min_range_size);
                 // Allow growing by up to 50% more than was requested.
-                if (candidate_range_size <= requested_range_size +| requested_range_size / 2) {
+                if (candidate_range_size <= min_range_size +| min_range_size / 2) {
                     break :range_size candidate_range_size;
                 } else {
                     return false;

@@ -49,7 +49,6 @@ pub fn obtain(cache: *Cache) Manifest {
         .hash = cache.hash,
         .manifest_file = null,
         .manifest_dirty = false,
-        .hex_digest = undefined,
     };
 }
 
@@ -251,7 +250,7 @@ pub const HashHelper = struct {
 
 pub fn binToHex(bin_digest: BinDigest) HexDigest {
     var out_digest: HexDigest = undefined;
-    var w: std.Io.Writer = .fixed(&out_digest);
+    var w: Io.Writer = .fixed(&out_digest);
     w.printHex(&bin_digest, .lower) catch unreachable;
     return out_digest;
 }
@@ -278,7 +277,6 @@ pub const Manifest = struct {
     cache: *Cache,
     /// Current state for incremental hashing.
     hash: HashHelper,
-    hex_digest: HexDigest,
     /// When this is null, `Manifest` is in "pre-check" phase. Otherwise it is in "post-check" phase.
     manifest_file: ?Io.File,
     manifest_dirty: bool,
@@ -309,8 +307,33 @@ pub const Manifest = struct {
     /// All contents from all `input_files` whose contents were requested,
     /// concatenated. Total byte size will be less than `max_input_content_len`
     /// otherwise an error is returned.
+    ///
+    /// Data is invalidated when `addFilePost` is called.
     all_input_content: std.ArrayList(u8) = .empty,
     max_input_content_len: usize = std.math.maxInt(u32),
+
+    /// State that exists only during check.
+    pub const Check = struct {
+        /// Protects `Manifest.diagnostic` from data races.
+        diagnostic_lock: bool = false,
+        status: Status = .hit,
+
+        pub const Status = enum { hit, miss };
+
+        pub const Error = error{
+            /// Unable to check the cache for a reason that has been recorded into
+            /// the `diagnostic` field.
+            CacheCheckFailed,
+            /// A cache manifest file exists however it could not be parsed.
+            InvalidFormat,
+        } || Allocator.Error || Io.Cancelable;
+
+        fn fail(c: *Check, m: *Manifest, diagnostic: Diagnostic) void {
+            if (!@atomicRmw(bool, &c.diagnostic_lock, .Xchg, true, .unordered)) {
+                m.diagnostic = diagnostic;
+            }
+        }
+    };
 
     pub const Files = std.array_hash_map.Custom(File.Offset, void, File.HashContext, false);
 
@@ -328,7 +351,7 @@ pub const Manifest = struct {
         have_stat: bool,
         /// Determines whether `File.digest` is populated.
         have_digest: bool,
-        contents: enum (usize) {
+        contents: enum(usize) {
             requested = std.math.maxInt(u32) - 1,
             not_requested = std.math.maxInt(u32),
             /// Byte offset index into `Manifest.all_input_content`.
@@ -356,10 +379,27 @@ pub const Manifest = struct {
         /// Terminated by zero byte, then followed by padding until 8-byte aligned.
         path_start: [0]u8,
 
-        pub const Flags = packed struct (u8) {
+        pub const Flags = packed struct(u8) {
             is_directory: bool,
             metadata_only: bool,
             prefix: u6,
+        };
+
+        /// Prefixes path names in encoded directory contents. Starts numbering
+        /// at `1` so that null byte can be used unambiguously as entry
+        /// separator.
+        pub const Kind = enum(u8) {
+            file = 1,
+            directory = 2,
+            other = 3,
+
+            pub fn fromStat(kind: Io.File.Kind) @This() {
+                return switch (kind) {
+                    .file => .file,
+                    .directory => .directory,
+                    else => .other,
+                };
+            }
         };
 
         /// Byte index within `Manifest.contents` where the entry starts.
@@ -392,7 +432,6 @@ pub const Manifest = struct {
             }
         };
 
-
         pub fn path(file: *const File) [:0]const u8 {
             return pathFallible(file) catch unreachable;
         }
@@ -408,7 +447,7 @@ pub const Manifest = struct {
             const path_len = mem.findScalar(u8, path_ptr, 0).?;
             comptime assert(@offsetOf(File, "path_start") - @offsetOf(File, "flags") == 1);
             // Includes flags and sentinel.
-            const hash_string = (path_ptr - 1)[0..path_len + 2];
+            const hash_string = (path_ptr - 1)[0 .. path_len + 2];
             hasher.update(hash_string);
         }
 
@@ -424,8 +463,19 @@ pub const Manifest = struct {
             }
         }
 
+        /// Returns true if the stat was changed. Updates the `file` with the new stat value.
+        fn setStatChanged(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!bool {
+            if (stat.size == file.size and
+                stat.mtime.nanoseconds == file.mtime and
+                stat.inode == file.inode)
+            {
+                return false;
+            } else {
+                setStat(file, m, stat);
+                return true;
+            }
+        }
     };
-
 
     pub const Diagnostic = union(enum) {
         none,
@@ -438,7 +488,7 @@ pub const Manifest = struct {
         file_hash: FileOp,
 
         pub const FileOp = struct {
-            file_index: usize,
+            file_offset: File.Offset,
             err: anyerror,
         };
     };
@@ -450,16 +500,24 @@ pub const Manifest = struct {
     };
 
     pub const AddInputFileOptions = struct {
+        /// If `is_directory` is true, this handle must be opened with
+        /// iteration capability.
         handle: ?Io.File = null,
         stat: ?Stat = null,
         request_handle: bool = false,
+        /// Can request file or directory contents depending on `is_directory`.
         request_contents: bool = false,
+        /// Contents of a directory are considered to be the sorted list of
+        /// file names of direct entries, separated by null byte. Each file name
+        /// is prefixed by `Io.File.Kind` byte, +1 so that the zero tag is
+        /// not aliased by the entry separator.
         is_directory: bool = false,
+        /// Content hashing skipped; any difference in metadata implies cache
+        /// miss.
         metadata_only: bool = false,
-
     };
 
-    pub const AddInputFileError = error {
+    pub const AddInputFileError = error{
         /// The same file path has been added to the cache manifest both as a
         /// directory and as a normal file, making the intended caching
         /// behavior ambiguous.
@@ -544,16 +602,6 @@ pub const Manifest = struct {
         _ = try addInputFile(m, opt_path orelse return, options);
     }
 
-    pub const CheckError = error{
-        /// Unable to check the cache for a reason that has been recorded into
-        /// the `diagnostic` field.
-        CacheCheckFailed,
-        /// A cache manifest file exists however it could not be parsed.
-        InvalidFormat,
-    } || Allocator.Error || Io.Cancelable;
-
-    pub const CheckStatus = enum { hit, miss };
-
     /// Check the cache to see if the input exists in it.
     /// A hex encoding of its hash is available by calling `final`.
     ///
@@ -566,13 +614,13 @@ pub const Manifest = struct {
     /// The lock on the manifest file is released when `deinit` is called. As another
     /// option, one may call `toOwnedLock` to obtain a smaller object which can represent
     /// the lock. `deinit` is safe to call whether or not `toOwnedLock` has been called.
-    pub fn check(man: *Manifest, parent_progress_node: std.Progress.Node) CheckError!CheckStatus {
+    pub fn check(man: *Manifest, parent_progress_node: std.Progress.Node) Check.Error!Check.Status {
         const node = parent_progress_node.start("Reusing Cache Artifacts", 0);
         defer node.end();
         return checkProgressless(man);
     }
 
-    pub fn checkProgressless(man: *Manifest) CheckError!CheckStatus {
+    pub fn checkProgressless(man: *Manifest) Check.Error!Check.Status {
         assert(man.manifest_file == null);
 
         for (man.files.keys()[0..man.input_files.items.len]) |file_off| {
@@ -583,9 +631,8 @@ pub const Manifest = struct {
 
         var bin_digest: BinDigest = undefined;
         man.hash.hasher.final(&bin_digest);
-        man.hex_digest = binToHex(bin_digest);
-
-        const manifest_file_path = &man.hex_digest;
+        const hex_digest = binToHex(bin_digest);
+        const manifest_file_path = &hex_digest;
         const io = man.cache.io;
 
         // We'll try to open the cache with an exclusive lock, but if that would block
@@ -724,7 +771,7 @@ pub const Manifest = struct {
 
     /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
     /// `self.files` contains only the original input files.
-    fn checkLocked(m: *Manifest) CheckError!CheckStatus {
+    fn checkLocked(m: *Manifest) Check.Error!Check.Status {
         const gpa = m.cache.gpa;
         const io = m.cache.io;
 
@@ -750,11 +797,12 @@ pub const Manifest = struct {
 
         // This group we would like to cancel as soon as a cache miss is discovered.
         const PostResult = union(enum) {
-            checkFile: CheckFileResult,
+            checkFile: Check.Status,
         };
         var post_select_buffer: [10]PostResult = undefined;
         var post_select: Io.Select(PostResult) = .init(&post_select_buffer);
         var post_select_remaining: usize = 0;
+        var c: Check = .{};
         defer post_select.cancel(io);
 
         while (off + 1 < m.contents.len) {
@@ -767,11 +815,11 @@ pub const Manifest = struct {
             if (file_index < m.input_files.items.len) {
                 if (m.files.keys()[file_index] != file_off) return error.InvalidFormat;
 
-                input_group.async(io, checkFile, .{m.cache, file, path});
+                input_group.async(io, checkInputFile, .{ m, &c, file_off, path });
             } else {
                 try m.files.put(gpa, file_off);
 
-                post_select.async(.checkFile, checkFile, .{m.cache, file, path});
+                post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
                 post_select_remaining += 1;
             }
 
@@ -794,6 +842,18 @@ pub const Manifest = struct {
         while (post_select_remaining > 0) {
             const n = try post_select.awaitMany(&post_await_buffer, 1);
             post_select_remaining -= n;
+
+            // Detect if input group already had a miss. In this case we still wait
+            // for those digests to be updated, but cancel the non input group.
+            switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
+                .miss => {
+                    post_select.cancelDiscard();
+                    try input_group.await(io);
+                    return .miss;
+                },
+                .hit => continue,
+            }
+
             for (post_await_buffer[0..n]) |u| switch (u) {
                 .checkFile => |result| switch (result) {
                     .hit => continue,
@@ -811,6 +871,7 @@ pub const Manifest = struct {
         }
 
         try input_group.await(io);
+        if (c.status == .miss) return .miss;
 
         for (m.files.keys()) |file_off| {
             m.hash.hasher.update(&file_off.get(m).digest);
@@ -819,54 +880,121 @@ pub const Manifest = struct {
         return .hit;
     }
 
-    const CheckFileResult = union(enum) {
-        hit,
-        miss,
-        fail: Diagnostic,
-    };
+    fn checkInputFile(m: *Manifest, c: *Check, file_off: File.Offset, file_path: [:0]const u8) Io.Cancelable!void {
+        // TODO use already open handle
+        // TODO use already provided stat
+        // TODO implement request_handle
+        // TODO implement request_contents
+        switch (try checkFile(m, c, file_off, file_path)) {
+            .hit => return,
+            .miss => @atomicStore(Check.Status, &c.status, .miss, .unordered),
+        }
+    }
 
     /// Runs concurrently with other `checkFile`.
-    fn checkFile(cache: *const Cache, file: *File, file_path: [:0]const u8) Io.Cancelable!CheckFileResult {
+    fn checkFile(
+        m: *Manifest,
+        c: *Check,
+        file_off: File.Offset,
+        file_path: [:0]const u8,
+    ) Io.Cancelable!Check.Status {
+        const file = file_off.get(m);
+        const cache = m.cache;
+        const gpa = cache.gpa;
         const io = cache.io;
-        const dir = cache.prefixes()[file.flags.prefix].handle;
+        const parent_dir = cache.prefixes()[file.flags.prefix].handle;
 
-        const this_file = dir.openFile(io, file_path, .{ .mode = .read_only }) catch |err| switch (err) {
-            error.FileNotFound => return .miss,
-            error.Canceled => |e| return e,
-            else => |e| return .{ .fail = .{ .file_open = .{
-                .file_index = file_index,
-                .err = e,
-            } }},
-        };
-        defer this_file.close(io);
+        if (file.flags.metadata_only) {
+            const actual_stat = parent_dir.statFile() catch |err| switch (err) {
+                error.FileNotFound => return .miss,
+                error.Canceled => |e| return e,
+                else => |e| return c.fail(m, .{ .file_stat = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
 
-        const actual_stat = this_file.stat(io) catch |err| return .{ .fail = .{ .file_stat = .{
-            .file_index = file_index,
-            .err = err,
-        } }};
-        const size_match = actual_stat.size == file.size;
-        const mtime_match = actual_stat.mtime.nanoseconds == file.mtime;
-        const inode_match = actual_stat.inode == file.inode;
+            const actual_is_directory = actual_stat.kind == .directory;
+            if (actual_is_directory != file.flags.is_directory) return .miss;
 
-        if (!size_match or !mtime_match or !inode_match) {
-            try file.setStat(actual_stat);
+            if (try file.setStatChanged(m, actual_stat)) return .miss;
 
-            var actual_digest: BinDigest = undefined;
-            hashFile(io, this_file, &actual_digest) catch |err| return .{ .fail = .{ .file_read = .{
-                .file_index = file_index,
-                .err = err,
-            } }};
+            return .hit;
+        }
 
-            if (!mem.eql(u8, &file.digest, &actual_digest)) {
-                file.digest = actual_digest;
-                return .miss;
+        if (file.flags.is_directory) {
+            const opened_dir = parent_dir.openDir(io, file_path, .{
+                .iterate = true,
+                .access_sub_paths = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => return .miss,
+                error.Canceled => |e| return e,
+                else => |e| return c.fail(m, .{ .file_open = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+            defer opened_dir.close(io);
+
+            const actual_stat = opened_dir.stat(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return c.fail(m, .{ .file_stat = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+            if (try file.setStatChanged(m, actual_stat)) {
+                const prev_digest: BinDigest = file.digest;
+                var contents: std.ArrayList(u8) = .empty;
+                defer contents.deinit(gpa);
+                hashDir(gpa, io, opened_dir, &file.digest, &contents) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return c.fail(m, .{ .file_read = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+
+                if (!mem.eql(u8, &file.digest, &prev_digest)) return .miss;
             }
+            return .hit;
+        }
+
+        const opened_file = parent_dir.openFile(io, file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+            error.FileNotFound, error.IsDir => return .miss,
+            error.Canceled => |e| return e,
+            else => |e| return c.fail(m, .{ .file_open = .{
+                .file_offset = file_off,
+                .err = e,
+            } }),
+        };
+        defer opened_file.close(io);
+
+        const actual_stat = opened_file.stat(io) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => |e| return c.fail(m, .{ .file_stat = .{
+                .file_offset = file_off,
+                .err = e,
+            } }),
+        };
+
+        if (try file.setStatChanged(m, actual_stat)) {
+            const prev_digest: BinDigest = file.digest;
+            hashFile(io, opened_file, &file.digest) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return c.fail(m, .{ .file_read = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+
+            if (!mem.eql(u8, &file.digest, &prev_digest)) return .miss;
         }
 
         return .hit;
     }
 
-    /// Reset `man.hash.hasher` to the state it should be in after `hit` returns `CheckStatus.miss`.
+    /// Reset `man.hash.hasher` to the state it should be in after `hit` returns `Check.Status.miss`.
     /// The hasher contains the original input digest, and all original input file digests (i.e.
     /// not including post files).
     ///
@@ -931,16 +1059,18 @@ pub const Manifest = struct {
             dir: ?Io.Dir,
         } = .{ .file = null },
         stat: ?Stat = null,
+        /// If it is a directory, there is a special encoding required for contents, which
+        /// is null-separated sorted entries, each one prefixed with `File.Kind`.
         contents: ?[]const u8 = null,
         metadata_only: bool = false,
     };
 
-    pub const AddFilePostError = error {
+    pub const AddFilePostError = error{
         /// The same file path has been added to the cache manifest both as a
         /// directory and as a normal file, making the intended caching
         /// behavior ambiguous.
         IsDirectoryAmbiguous,
-    } || Allocator.Error;
+    } || Io.Cancelable || Allocator.Error;
 
     /// Add a file as a dependency of process being cached, after cache miss
     /// occurs.
@@ -1006,7 +1136,10 @@ pub const Manifest = struct {
                 try populateDirectory(m, header, need_stat, handle, options.contents, header.metadata_only);
             } else {
                 const dir = cache.prefixes()[header.flags.prefix].handle;
-                const handle = try dir.openDir(io, header.path(), .{ .access_sub_paths = false, .iterate = true, });
+                const handle = try dir.openDir(io, header.path(), .{
+                    .access_sub_paths = false,
+                    .iterate = true,
+                });
                 defer handle.close(io);
                 try populateDirectory(m, header, need_stat, handle, options.contents, header.metadata_only);
             },
@@ -1022,7 +1155,14 @@ pub const Manifest = struct {
         }
     }
 
-    fn populateFile(m: *Manifest, file: *File, need_stat: bool, handle: Io.File, contents: ?[]const u8, metadata_only: bool,) !void {
+    fn populateFile(
+        m: *Manifest,
+        file: *File,
+        need_stat: bool,
+        handle: Io.File,
+        contents: ?[]const u8,
+        metadata_only: bool,
+    ) !void {
         const io = m.cache.io;
 
         if (need_stat) {
@@ -1039,14 +1179,32 @@ pub const Manifest = struct {
         }
     }
 
-    fn populateDirectory(m: *Manifest, file: *File, need_stat: bool, handle: Io.File, contents: ?[]const u8, metadata_only: bool,) !void {
-        _ = m;
-        _ = file;
-        _ = need_stat;
-        _ = handle;
-        _ = contents;
-        _ = metadata_only;
-        @panic("TODO");
+    fn populateDirectory(
+        m: *Manifest,
+        file: *File,
+        need_stat: bool,
+        handle: Io.Dir,
+        contents: ?[]const u8,
+        metadata_only: bool,
+    ) !void {
+        const cache = m.cache;
+        const io = cache.io;
+        const gpa = cache.gpa;
+
+        if (need_stat) {
+            const stat = try handle.stat(io);
+            try file.setStat(m, stat);
+        }
+        if (metadata_only) return;
+        if (contents) |bytes| {
+            var hasher = hasher_init;
+            hasher.update(bytes);
+            hasher.final(&file.digest);
+        } else {
+            const prev_contents_len = m.all_input_content.items.len;
+            defer m.all_input_content.shrinkRetainingCapacity(prev_contents_len);
+            try hashDir(gpa, io, handle, &file.digest, &m.all_input_content);
+        }
     }
 
     pub fn addDepFile(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
@@ -1062,7 +1220,7 @@ pub const Manifest = struct {
     fn addDepFileMaybePost(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
         const gpa = self.cache.gpa;
         const io = self.cache.io;
-        const dep_file_contents = try dir.readFileAlloc(io, dep_file_sub_path, gpa, .limited(file_size_max));
+        const dep_file_contents = try dir.readFileAlloc(io, dep_file_sub_path, gpa, .unlimited);
         defer gpa.free(dep_file_contents);
 
         var error_buf: std.ArrayList(u8) = .empty;
@@ -1124,7 +1282,6 @@ pub const Manifest = struct {
         const io = m.cache.io;
         const manifest_file = m.manifest_file.?;
         if (m.manifest_dirty) {
-
             m.contents.appendAssumeCapacity(0);
             defer _ = m.contents.pop().?;
 
@@ -1264,22 +1421,85 @@ pub const Manifest = struct {
             other_file.prefix = prefix_map[other_file.prefix];
         }
     }
+
+    fn hashFile(io: Io, file: Io.File, bin_digest: *[Hasher.mac_length]u8) Io.File.ReadPositionalError!void {
+        var buffer: [2048]u8 = undefined;
+        var hasher = hasher_init;
+        var offset: u64 = 0;
+        while (true) {
+            const n = try file.readPositional(io, &.{&buffer}, offset);
+            if (n == 0) break;
+            hasher.update(buffer[0..n]);
+            offset += n;
+        }
+        hasher.final(bin_digest);
+    }
+
+    const HashDirError = Io.Dir.Reader.Error || Allocator.Error;
+
+    /// Appends the sorted, encoded directory entries to `contents`.
+    fn hashDir(
+        gpa: Allocator,
+        io: Io,
+        dir: Io.Dir,
+        bin_digest: *[Hasher.mac_length]u8,
+        contents: *std.ArrayList(u8),
+    ) HashDirError!void {
+        var buffer: [@max(2048, Io.Dir.Reader.min_buffer_len)]u8 align(@alignOf(usize)) = undefined;
+        var reader: Io.Dir.Reader = .init(dir, &buffer);
+        var entry_buffer: [16]Io.Dir.Entry = undefined;
+
+        const contents_start = contents.items.len;
+        errdefer contents.shrinkRetainingCapacity(contents_start);
+
+        // Each index points into `contents`.
+        var entries_list: std.ArrayList(u32) = .empty;
+        defer entries_list.deinit(gpa);
+
+        while (true) {
+            const entries = entry_buffer[0..try reader.read(io, &entry_buffer)];
+            for (try entries_list.addManyAsSlice(gpa, entries.len), entries) |*off, entry| {
+                off.* = contents.items.len;
+                // As an optimization, make the reservation also count the duplication
+                // of the contents buffer that will be required after sorting.
+                try contents.ensureUnusedCapacity(gpa, (contents.items.len + entry.name.len + 2 - contents_start) * 2);
+                contents.appendAssumeCapacity(@backingInt(Manifest.File.Kind.fromStat(entry.kind)));
+                contents.appendSliceAssumeCapacity(entry.name);
+                contents.appendAssumeCapacity(0);
+            }
+        }
+
+        const Sort = struct {
+            contents: []const u8,
+            pub fn lessThan(this: @This(), lhs: u32, rhs: u32) bool {
+                return mem.lessThanZ(u8, this.contents[lhs + 1 ..], this.contents[rhs + 1 ..]); // +1 for kind byte
+            }
+        };
+        mem.sortUnstable(u32, entries_list.items, @as(Sort, .{ .contents = contents.items }), Sort.lessThan);
+
+        // Duplicate the contents such that we may refer to it while creating a
+        // sorted copy in the original position (at contents_start). We will then
+        // offset all the entries_list offsets by contents len when reading from the unsorted copy.
+        const contents_len = contents.items.len - contents_start;
+        @memcpy(contents.addManyAsSliceAssumeCapacity(contents_len), contents.items[contents_start..][0..contents_len]);
+
+        var new_offset: usize = contents_start;
+        for (entries_list.items) |wrong_offset| {
+            const offset = wrong_offset + contents_len;
+            // Includes the kind prefix which we also want to copy.
+            const entry: [*:0]const u8 = @ptrCast(contents.items[offset..]);
+            new_offset += mem.copySentinel(u8, 0, contents.items[new_offset..], entry);
+        }
+        assert(new_offset == contents_start + contents_len);
+        contents.shrinkRetainingCapacity(contents_start + contents_len);
+
+        var hasher = hasher_init;
+        hasher.update(contents.items[contents_start..][0..contents_len]);
+        hasher.final(bin_digest);
+    }
 };
 
-fn hashFile(io: Io, file: Io.File, bin_digest: *[Hasher.mac_length]u8) Io.File.ReadPositionalError!void {
-    var buffer: [2048]u8 = undefined;
-    var hasher = hasher_init;
-    var offset: u64 = 0;
-    while (true) {
-        const n = try file.readPositional(io, &.{&buffer}, offset);
-        if (n == 0) break;
-        hasher.update(buffer[0..n]);
-        offset += n;
-    }
-    hasher.final(bin_digest);
-}
-
-// Create/Write a file, close it, then grab its stat.mtime timestamp.
+/// Create/Write a file, close it, then grab its stat.mtime timestamp.
 fn testGetCurrentFileTimestamp(io: Io, dir: Io.Dir) !Io.Timestamp {
     const test_out_file = "test-filetimestamp.tmp";
 
@@ -1312,7 +1532,7 @@ test "cache file and then recall it" {
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
     while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+        try Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
     }
 
     var digest1: HexDigest = undefined;
@@ -1382,7 +1602,7 @@ test "check that changing a file makes cache fail" {
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
     while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+        try Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
     }
 
     var digest1: HexDigest = undefined;
@@ -1508,7 +1728,7 @@ test "Manifest with files added after initial hash work" {
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
     while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+        try Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
     }
 
     var digest1: HexDigest = undefined;
@@ -1560,7 +1780,7 @@ test "Manifest with files added after initial hash work" {
         // Wait for file timestamps to tick
         const initial_time2 = try testGetCurrentFileTimestamp(io, tmp.dir);
         while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time2.nanoseconds) {
-            try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+            try Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
         }
 
         {

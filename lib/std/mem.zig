@@ -269,6 +269,18 @@ pub fn copyBackwards(comptime T: type, dest: []T, source: []const T) void {
     }
 }
 
+/// Copy `source` into `dest`. Asserts no overlap. Asserts `dest.len` greater
+/// or equal to source len. Returns number of elements copied.
+pub fn copySentinel(comptime T: type, comptime s: T, dest: []T, source: [*:s]const T) usize {
+    const i = findSentinel(T, s, source);
+    @memcpy(dest[0..i], source[0..i]);
+    return i;
+}
+
+test copySentinel {
+    @panic("TODO");
+}
+
 /// Generally, Zig users are encouraged to explicitly initialize all fields of a struct explicitly rather than using this function.
 /// However, it is recognized that there are sometimes use cases for initializing all fields to a "zero" value. For example, when
 /// interfacing with a C API where this practice is more common and relied upon. If you are performing code review and see this
@@ -731,6 +743,20 @@ test lessThan {
     try testing.expect(lessThan(u8, "abc", "abc0"));
     try testing.expect(!lessThan(u8, "", ""));
     try testing.expect(lessThan(u8, "", "a"));
+}
+
+/// Returns `true` if `lhs < rhs`; `false` otherwise, operating on
+/// null-terminated arrays.
+pub fn lessThanZ(comptime T: type, lhs: [*:0]const T, rhs: [*:0]const T) bool {
+    return orderZ(T, lhs, rhs) == .lt;
+}
+
+test lessThanZ {
+    try testing.expect(lessThanZ(u8, "abcd", "bee"));
+    try testing.expect(!lessThanZ(u8, "abc", "abc"));
+    try testing.expect(lessThanZ(u8, "abc", "abc0"));
+    try testing.expect(!lessThanZ(u8, "", ""));
+    try testing.expect(lessThanZ(u8, "", "a"));
 }
 
 const use_vectors = switch (builtin.zig_backend) {

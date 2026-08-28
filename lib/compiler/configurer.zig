@@ -42,6 +42,12 @@ pub fn main(init: process.Init.Minimal) !void {
     const zig_exe = expectArgOrFatal(args, &arg_i, "--zig");
     const build_root_sub_path = expectArgOrFatal(args, &arg_i, "--build-root");
 
+    const cwd: Io.Dir = .cwd();
+    const build_root_directory: std.Build.Cache.Directory = if (std.mem.eql(u8, build_root_sub_path, ".")) .cwd() else .{
+        .handle = try cwd.openDir(io, build_root_sub_path, .{}),
+        .path = build_root_sub_path,
+    };
+
     var graph: std.Build.Graph = .{
         .io = io,
         .arena = arena,
@@ -53,6 +59,7 @@ pub fn main(init: process.Init.Minimal) !void {
         },
         .generated_files = .empty,
         .zig_exe = zig_exe,
+        .build_root_directory = build_root_directory,
 
         // Created before running the user's configure script so that some things
         // can be added during script execution such as strings.
@@ -66,16 +73,7 @@ pub fn main(init: process.Init.Minimal) !void {
     assert(try graph.wip_configuration.addString("") == .empty);
     assert(try graph.wip_configuration.addString("root") == .root);
 
-    const cwd: Io.Dir = .cwd();
-
-    const build_root: std.Build.Cache.Path = if (std.mem.eql(u8, build_root_sub_path, ".")) .cwd() else .{
-        .root_dir = .{
-            .handle = try cwd.openDir(io, build_root_sub_path, .{}),
-            .path = build_root_sub_path,
-        },
-    };
-
-    const builder = try std.Build.create(&graph, build_root, dependencies.root_deps);
+    const builder = try std.Build.create(&graph, .{ .root_dir = build_root_directory }, dependencies.root_deps);
 
     var color: Color = .auto;
 

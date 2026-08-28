@@ -3751,13 +3751,8 @@ pub fn packagePath(
         .root_dir = graph.build_root_directory,
         .sub_path = sub_path,
     };
-
-    // Currently, neither configurer nor Maker is aware of the standard zig
-    // package path, and the root path is stored as a bare string rather than
-    // relative to a known base directory. Without changing that, we must
-    // construct a cwd relative path here.
     return .{
-        .root_dir = .cwd(),
+        .root_dir = graph.build_root_directory,
         .sub_path = try Dir.path.join(arena, &.{ package.root_path.slice(c), sub_path }),
     };
 }

@@ -285,9 +285,9 @@ pub const JobQueue = struct {
             }
 
             try w.print(
-                \\        pub const build_root = "{f}";
+                \\        pub const build_root = {q};
                 \\
-            , .{std.fmt.alt(fetch.package_root, .formatEscapeString)});
+            , .{fetch.package_root.sub_path});
 
             if (fetch.has_build_zig) {
                 try w.print(

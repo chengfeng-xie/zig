@@ -79,6 +79,7 @@ pub const Graph = struct {
     system_integration_options: std.array_hash_map.String(SystemLibraryMode) = .empty,
     system_package_mode: bool = false,
     zig_exe: []const u8,
+    build_root_directory: Cache.Directory,
     environ_map: process.Environ.Map,
     needed_lazy_dependencies: std.array_hash_map.String(void) = .empty,
     /// Information about the native target. Computed before build() is invoked.
@@ -2115,11 +2116,12 @@ fn dependencyResolved(
         .options = package_options,
     }, .{})) |dep| return dep;
 
+    const dep_root_path = graph.build_root_directory.join(graph.arena, &.{entry.build_root}) catch @panic("OOM");
     const dep_root: Cache.Path = .{
         .root_dir = .{
-            .path = entry.build_root,
-            .handle = Io.Dir.cwd().openDir(io, entry.build_root, .{}) catch |err|
-                fatal("failed to open {q}: {t}", .{ entry.build_root, err }),
+            .path = dep_root_path,
+            .handle = Io.Dir.cwd().openDir(io, dep_root_path, .{}) catch |err|
+                fatal("failed to open {q}: {t}", .{ dep_root_path, err }),
         },
     };
 

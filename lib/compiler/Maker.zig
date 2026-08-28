@@ -3492,18 +3492,11 @@ pub fn packagePath(
 ) Allocator.Error!Path {
     const c = &maker.scanned_config.configuration;
     const graph = maker.graph;
-    const package = package_index.get(c) orelse return .{
-        .root_dir = graph.build_root_directory,
-        .sub_path = sub_path,
-    };
-
-    // Currently, neither configurer nor Maker is aware of the standard zig
-    // package path, and the root path is stored as a bare string rather than
-    // relative to a known base directory. Without changing that, we must
-    // construct a cwd relative path here.
     return .{
-        .root_dir = .cwd(),
-        .sub_path = try Dir.path.join(arena, &.{ package.root_path.slice(c), sub_path }),
+        .root_dir = graph.build_root_directory,
+        .sub_path = if (package_index.get(c)) |package| try Dir.path.join(arena, &.{
+            package.root_path.slice(c), sub_path,
+        }) else sub_path,
     };
 }
 

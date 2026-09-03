@@ -508,13 +508,6 @@ pub const Manifest = struct {
         metadata_only: bool = false,
     };
 
-    pub const AddInputPathError = error{
-        /// The same file path has been added to the cache manifest both as a
-        /// directory and as a normal file, making the intended caching
-        /// behavior ambiguous.
-        IsDirectoryAmbiguous,
-    } || Allocator.Error;
-
     /// Add a file or directory path as a dependency of process being cached.
     /// When `hit` is called, the contents will be checked to ensure
     /// that it matches the contents from previous times.
@@ -530,7 +523,7 @@ pub const Manifest = struct {
     ///
     /// See also:
     /// * `addPathPost`
-    pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) AddInputPathError!InputPath.Index {
+    pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) Allocator.Error!InputPath.Index {
         const gpa = m.cache.gpa;
         try m.files.ensureUnusedCapacity(gpa, 1);
         try m.input_paths.ensureUnusedCapacity(gpa, 1);
@@ -573,8 +566,10 @@ pub const Manifest = struct {
                 existing_header.inode = stat.inode;
                 existing_header.mtime = stat.mtime;
             }
-            if (existing_header.flags.is_directory != options.is_directory)
-                return error.IsDirectoryAmbiguous;
+            // If it trips, the same file path has been added to the cache
+            // manifest both as a directory and as a normal file, making the
+            // intended caching behavior ambiguous.
+            assert(existing_header.flags.is_directory == options.is_directory);
             if (!options.metadata_only)
                 existing_header.flags.metadata_only = false;
         } else {
@@ -1078,12 +1073,7 @@ pub const Manifest = struct {
         metadata_only: bool = false,
     };
 
-    pub const AddPathPostError = error{
-        /// The same file path has been added to the cache manifest both as a
-        /// directory and as a normal file, making the intended caching
-        /// behavior ambiguous.
-        IsDirectoryAmbiguous,
-    } || Io.Cancelable || Allocator.Error;
+    pub const AddPathPostError = Io.Cancelable || Allocator.Error;
 
     /// Add a file as a dependency of process being cached, after cache miss
     /// occurs.
@@ -1126,8 +1116,10 @@ pub const Manifest = struct {
             m.contents.shrinkRetainingCapacity(prev_contents_len);
             const existing_off = gop.key_ptr.*;
             const header = existing_off.get(m);
-            if (header.flags.is_directory != is_directory)
-                return error.IsDirectoryAmbiguous;
+            // If it trips, the same file path has been added to the cache
+            // manifest both as a directory and as a normal file, making the
+            // intended caching behavior ambiguous.
+            assert(header.flags.is_directory == is_directory);
             if (!options.metadata_only)
                 header.flags.metadata_only = false;
             break :h header;

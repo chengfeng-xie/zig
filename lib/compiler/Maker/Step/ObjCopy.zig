@@ -34,7 +34,7 @@ pub fn make(
     defer man.deinit();
 
     const input_path = try maker.resolveLazyPath(arena, input_lazy_path, step_index);
-    _ = try man.addFilePath(input_path, null);
+    _ = try man.addInputPath(input_path, .{});
     man.hash.addOptionalBytes(only_section);
     man.hash.addOptionalBytes(opt_basename);
     man.hash.addOptionalBytes(opt_debug_basename);

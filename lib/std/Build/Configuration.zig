@@ -1875,7 +1875,7 @@ pub const PathDep = extern struct {
         is_directory: bool,
         metadata_only: bool,
         base: LazyPath.Relative.Base,
-        _: u16 = 0,
+        _: u22 = 0,
     };
 };
 

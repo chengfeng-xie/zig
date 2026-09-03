@@ -327,12 +327,14 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
     man.hash.add(target.abi);
     man.hash.add(target_version);
 
-    const abilists_index = try man.addFilePath(.{
+    const abilists_index = try man.addInputPath(.{
         .root_dir = comp.dirs.zig_lib,
         .sub_path = abilists_path,
-    }, abilists_max_size);
+    }, .{
+        .request_contents = true,
+    });
 
-    if (try man.hit(prog_node)) {
+    if (try man.check(prog_node)) {
         const digest = man.final();
 
         return queueSharedObjects(comp, .{

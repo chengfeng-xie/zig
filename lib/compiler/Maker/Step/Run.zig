@@ -97,7 +97,7 @@ pub fn make(
                 man.hash.add(arg.flags.make_absolute);
                 man.hash.addBytesZ(prefix);
                 man.hash.addBytesZ(suffix);
-                _ = try man.addFilePath(file_path, null);
+                _ = try man.addInputPath(file_path, .{});
             },
             .path_directory => {
                 const prefix = if (arg.prefix.value) |p| p.slice(conf) else "";
@@ -135,7 +135,7 @@ pub fn make(
                 argv_list.appendAssumeCapacity(result.written());
                 man.hash.addBytesZ(prefix);
                 man.hash.addBytesZ(suffix);
-                _ = try man.addFilePath(file_path, null);
+                _ = try man.addInputPath(file_path, .{});
             },
             .artifact => {
                 const prefix = if (arg.prefix.value) |p| p.slice(conf) else "";
@@ -155,7 +155,7 @@ pub fn make(
                 man.hash.add(arg.flags.make_absolute);
                 man.hash.addBytesZ(prefix);
                 man.hash.addBytesZ(suffix);
-                _ = try man.addFilePath(file_path, null);
+                _ = try man.addInputPath(file_path, .{});
             },
             .output_file, .output_directory => {
                 const prefix = if (arg.prefix.value) |p| p.slice(conf) else "";
@@ -211,7 +211,7 @@ pub fn make(
         },
         .lazy_path => |lazy_path| {
             const file_path = try maker.resolveLazyPathIndex(arena, lazy_path, run_index);
-            _ = try man.addFilePath(file_path, null);
+            _ = try man.addInputPath(file_path, .{});
         },
         .none => {},
     }
@@ -240,7 +240,7 @@ pub fn make(
 
     for (conf_run.file_inputs.slice) |lazy_path| {
         const file_path = try maker.resolveLazyPathIndex(arena, lazy_path, run_index);
-        _ = try man.addFilePath(file_path, null);
+        _ = try man.addInputPath(file_path, .{});
     }
 
     if (conf_run.cwd.value) |lazy_path| {

@@ -1340,19 +1340,19 @@ pub const cache_helpers = struct {
         }
     }
 
-    pub fn hashCSource(self: *Cache.Manifest, c_source: CSourceFile) !void {
-        _ = try self.addFilePath(.initCwd(c_source.src_path), null);
+    pub fn hashCSource(man: *Cache.Manifest, c_source: CSourceFile) !void {
+        _ = try man.addInputPath(.initCwd(c_source.src_path), .{});
         // Hash the extra flags, with special care to call addFile for file parameters.
         // TODO this logic can likely be improved by utilizing clang_options_data.zig.
         const file_args = [_][]const u8{"-include"};
         var arg_i: usize = 0;
         while (arg_i < c_source.extra_flags.len) : (arg_i += 1) {
             const arg = c_source.extra_flags[arg_i];
-            self.hash.addBytes(arg);
+            man.hash.addBytes(arg);
             for (file_args) |file_arg| {
                 if (mem.eql(u8, file_arg, arg) and arg_i + 1 < c_source.extra_flags.len) {
                     arg_i += 1;
-                    _ = try self.addFilePath(.initCwd(c_source.extra_flags[arg_i]), null);
+                    _ = try man.addInputPath(.initCwd(c_source.extra_flags[arg_i]), .{});
                 }
             }
         }
@@ -2830,7 +2830,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                 man.want_shared_lock = false;
             }
 
-            const is_hit = man.hit(main_progress_node) catch |err| switch (err) {
+            const is_hit = man.check(main_progress_node) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
                 error.CacheCheckFailed => switch (man.diagnostic) {
                     .none => unreachable,
@@ -3394,7 +3394,7 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
     try link.hashInputs(man, comp.link_inputs);
 
     for (comp.c_objects.items) |c_object| {
-        _ = try man.addFilePath(.initCwd(c_object.src.src_path), null);
+        _ = try man.addInputPath(.initCwd(c_object.src.src_path), .{});
         man.hash.addOptional(c_object.src.ext);
         man.hash.addListOfBytes(c_object.src.extra_flags);
     }
@@ -3402,11 +3402,11 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
     for (comp.win32_resources.items) |win32_resource| {
         switch (win32_resource.src) {
             .rc => |rc_src| {
-                _ = try man.addFilePath(.initCwd(rc_src.src_path), null);
+                _ = try man.addInputPath(.initCwd(rc_src.src_path), .{});
                 man.hash.addListOfBytes(rc_src.extra_flags);
             },
             .manifest => |manifest_path| {
-                _ = try man.addFilePath(.initCwd(manifest_path), null);
+                _ = try man.addInputPath(.initCwd(manifest_path), .{});
             },
         }
     }
@@ -5540,7 +5540,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: std.Pr
     const target = comp.getTarget();
     assert(target.ofmt != .c);
     const o_ext = target.ofmt.fileExt(target.cpu.arch);
-    const digest = if (!comp.disable_c_depfile and try man.hit(child_progress_node)) man.final() else blk: {
+    const digest = if (!comp.disable_c_depfile and try man.check(child_progress_node)) man.final() else blk: {
         var argv: std.array_list.Managed([]const u8) = .init(gpa);
         defer argv.deinit();
 
@@ -5801,7 +5801,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: std.Pr
         }
 
         // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
-        if (comp.disable_c_depfile) _ = try man.hit(child_progress_node);
+        if (comp.disable_c_depfile) _ = try man.check(child_progress_node);
 
         // Rename into place.
         const digest = man.final();
@@ -5884,12 +5884,12 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
     // the XML data as a RT_MANIFEST resource. This means we can skip preprocessing,
     // include paths, CLI options, etc.
     if (win32_resource.src == .manifest) {
-        _ = try man.addFilePath(.initCwd(src_path), null);
+        _ = try man.addInputPath(.initCwd(src_path), .{});
 
         const rc_basename = try std.fmt.allocPrint(arena, "{s}.rc", .{src_basename});
         const res_basename = try std.fmt.allocPrint(arena, "{s}.res", .{src_basename});
 
-        const digest = if (try man.hit(child_progress_node)) man.final() else blk: {
+        const digest = if (try man.check(child_progress_node)) man.final() else blk: {
             // The digest only depends on the .manifest file, so we can
             // get the digest now and write the .res directly to the cache
             const digest = man.final();
@@ -5977,12 +5977,12 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
     // We now know that we're compiling an .rc file
     const rc_src = win32_resource.src.rc;
 
-    _ = try man.addFilePath(.initCwd(rc_src.src_path), null);
+    _ = try man.addInputPath(.initCwd(rc_src.src_path), .{});
     man.hash.addListOfBytes(rc_src.extra_flags);
 
     const rc_basename_noext = src_basename[0 .. src_basename.len - fs.path.extension(src_basename).len];
 
-    const digest = if (try man.hit(child_progress_node)) man.final() else blk: {
+    const digest = if (try man.check(child_progress_node)) man.final() else blk: {
         var zig_cache_tmp_dir = try comp.dirs.local_cache.handle.createDirPathOpen(io, "tmp", .{});
         defer zig_cache_tmp_dir.close(io);
 

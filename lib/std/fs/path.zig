@@ -860,12 +860,26 @@ fn testCompareDiskDesignators(expected_result: bool, kind: DiskDesignatorKind, p
     try std.testing.expectEqual(expected_result, compareDiskDesignators(u16, kind, wtf16_buf1[0..w1_len], wtf16_buf2[0..w2_len]));
 }
 
-/// On Windows, this calls `resolveWindows` and on POSIX it calls `resolvePosix`.
-pub fn resolve(allocator: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
-    if (native_os == .windows) {
-        return resolveWindows(allocator, paths);
-    } else {
-        return resolvePosix(allocator, paths);
+/// Deprecated in favor of `resolveAlloc`.
+pub const resolve = resolveAlloc;
+/// Deprecated in favor of `resolveAllocWindows`.
+pub const resolveWindows = resolveAllocWindows;
+/// Deprecated in favor of `resolveAllocPosix`.
+pub const resolvePosix = resolveAllocPosix;
+
+/// On Windows, calls `resolveAllocWindows`; otherwise calls `resolveAllocPosix`.
+pub fn resolveAlloc(gpa: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
+    switch (native_os) {
+        .windows => return resolveAllocWindows(gpa, paths),
+        else => return resolveAllocPosix(gpa, paths),
+    }
+}
+
+/// On Windows, calls `resolveAppendWindows`; otherwise calls `resolveAppendPosix`.
+pub fn resolveAppend(gpa: Allocator, al: *std.ArrayList(u8), paths: []const []const u8) Allocator.Error!void {
+    switch (native_os) {
+        .windows => return resolveAppendWindows(gpa, al, paths),
+        else => return resolveAppendPosix(gpa, al, paths),
     }
 }
 
@@ -891,7 +905,7 @@ pub fn resolve(allocator: Allocator, paths: []const []const u8) Allocator.Error!
 /// Note: all usage of this function should be audited due to the existence of symlinks.
 /// Without performing actual syscalls, resolving `..` could be incorrect.
 /// This API may break in the future: https://github.com/ziglang/zig/issues/13613
-pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
+pub fn resolveAllocWindows(allocator: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
     // Avoid heap allocation when paths.len is <= @bitSizeOf(usize) * 2
     // (we use `* 3` because stackFallback uses 1 usize as a length)
     var buf: [3]usize = undefined;
@@ -1093,6 +1107,13 @@ pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) Allocator
     return result.toOwnedSlice(allocator);
 }
 
+pub fn resolveAppendWindows(gpa: Allocator, al: *std.ArrayList(u8), paths: []const []const u8) Allocator.Error!void {
+    _ = gpa;
+    _ = al;
+    _ = paths;
+    @panic("TODO");
+}
+
 /// Simulates a series of relative directory changes on a virtual filesystem
 /// that has no symlinks.
 ///
@@ -1105,7 +1126,7 @@ pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) Allocator
 /// This function does not perform any syscalls. Executing this series of path
 /// lookups on an actual filesystem may produce different results due to
 /// symlinks.
-pub fn resolvePosix(gpa: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
+pub fn resolveAllocPosix(gpa: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
     assert(paths.len > 0);
 
     var result: std.ArrayList(u8) = .empty;
@@ -1178,7 +1199,7 @@ pub fn resolvePosix(gpa: Allocator, paths: []const []const u8) Allocator.Error![
     }
 }
 
-pub fn resolvePosix2(gpa: Allocator, al: *std.ArrayList(u8), paths: []const []const u8) Allocator.Error!void {
+pub fn resolveAppendPosix(gpa: Allocator, al: *std.ArrayList(u8), paths: []const []const u8) Allocator.Error!void {
     _ = gpa;
     _ = al;
     _ = paths;
@@ -1199,7 +1220,7 @@ test resolve {
     try testResolvePosix(&[_][]const u8{""}, ".");
 }
 
-test resolveWindows {
+test resolveAllocWindows {
     try testResolveWindows(
         &[_][]const u8{ "Z:\\", "/usr/local", "lib\\zig\\std\\array_list.zig" },
         "Z:\\usr\\local\\lib\\zig\\std\\array_list.zig",
@@ -1287,7 +1308,7 @@ test resolveWindows {
     try testResolveWindows(&[_][]const u8{ "C:\\", "\\??\\C:\\foo", "bar" }, "C:\\??\\C:\\foo\\bar");
 }
 
-test resolvePosix {
+test resolveAllocPosix {
     try testResolvePosix(&.{ "/a/b", "c" }, "/a/b/c");
     try testResolvePosix(&.{ "/a/b", "c", "//d", "e///" }, "/d/e");
     try testResolvePosix(&.{ "/a/b/c", "..", "../" }, "/a");
@@ -1306,13 +1327,13 @@ test resolvePosix {
 }
 
 fn testResolveWindows(paths: []const []const u8, expected: []const u8) !void {
-    const actual = try resolveWindows(testing.allocator, paths);
+    const actual = try resolveAllocWindows(testing.allocator, paths);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings(expected, actual);
 }
 
 fn testResolvePosix(paths: []const []const u8, expected: []const u8) !void {
-    const actual = try resolvePosix(testing.allocator, paths);
+    const actual = try resolveAllocPosix(testing.allocator, paths);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings(expected, actual);
 }
@@ -1657,9 +1678,9 @@ fn windowsResolveAgainstCwd(
         .unc_absolute,
         .root_local_device,
         .local_device,
-        => try resolveWindows(gpa, &.{path}),
+        => try resolveAllocWindows(gpa, &.{path}),
 
-        .relative => try resolveWindows(gpa, &.{ cwd, path }),
+        .relative => try resolveAllocWindows(gpa, &.{ cwd, path }),
 
         .rooted => blk: {
             const parsed_cwd = parsePathWindows(u8, cwd);
@@ -1667,13 +1688,13 @@ fn windowsResolveAgainstCwd(
                 .drive_absolute => {
                     var drive_buf = "_:\\".*;
                     drive_buf[0] = cwd[0];
-                    break :blk try resolveWindows(gpa, &.{ &drive_buf, path });
+                    break :blk try resolveAllocWindows(gpa, &.{ &drive_buf, path });
                 },
                 .unc_absolute => {
-                    break :blk try resolveWindows(gpa, &.{ parsed_cwd.root, path });
+                    break :blk try resolveAllocWindows(gpa, &.{ parsed_cwd.root, path });
                 },
                 // Effectively a malformed CWD, give up and just return a normalized path
-                else => break :blk try resolveWindows(gpa, &.{path}),
+                else => break :blk try resolveAllocWindows(gpa, &.{path}),
             }
         },
         .drive_relative => blk: {
@@ -1702,7 +1723,7 @@ fn windowsResolveAgainstCwd(
                 break :drive_cwd drive_buf;
             };
             defer temp_allocator.free(drive_cwd);
-            break :blk try resolveWindows(gpa, &.{ drive_cwd, path });
+            break :blk try resolveAllocWindows(gpa, &.{ drive_cwd, path });
         },
     };
 }
@@ -1716,9 +1737,9 @@ fn windowsResolveAgainstCwd(
 /// on each), a zero-length string is returned.
 ///
 pub fn relativePosix(allocator: Allocator, cwd: []const u8, from: []const u8, to: []const u8) Allocator.Error![]u8 {
-    const resolved_from = try resolvePosix(allocator, &[_][]const u8{ cwd, from });
+    const resolved_from = try resolveAllocPosix(allocator, &[_][]const u8{ cwd, from });
     defer allocator.free(resolved_from);
-    const resolved_to = try resolvePosix(allocator, &[_][]const u8{ cwd, to });
+    const resolved_to = try resolveAllocPosix(allocator, &[_][]const u8{ cwd, to });
     defer allocator.free(resolved_to);
 
     var from_it = mem.tokenizeScalar(u8, resolved_from, '/');

@@ -294,7 +294,7 @@ pub const Manifest = struct {
     files: Files = .empty,
     /// Indexes line up with `files`, but only up until `hit` is called. Uses
     /// `Cache.gpa`.
-    input_files: std.ArrayList(InputFile) = .empty,
+    input_paths: std.ArrayList(InputPath) = .empty,
     diagnostic: Diagnostic = .none,
     /// Keeps track of the last time we performed a file system write to observe
     /// what time the file system thinks it is, according to its own granularity.
@@ -304,11 +304,11 @@ pub const Manifest = struct {
     /// final terminating byte can be added without allocation. Uses
     /// `Cache.gpa`.
     contents: std.ArrayList(u8) = .empty,
-    /// All contents from all `input_files` whose contents were requested,
+    /// All contents from all `input_paths` whose contents were requested,
     /// concatenated. Total byte size will be less than `max_input_content_len`
     /// otherwise an error is returned.
     ///
-    /// Data is invalidated when `addFilePost` is called.
+    /// Data is invalidated when `addPathPost` is called.
     all_input_content: std.ArrayList(u8) = .empty,
     max_input_content_len: usize = std.math.maxInt(u32),
 
@@ -328,23 +328,24 @@ pub const Manifest = struct {
             InvalidFormat,
         } || Allocator.Error || Io.Cancelable;
 
-        fn fail(c: *Check, m: *Manifest, diagnostic: Diagnostic) void {
-            if (!@atomicRmw(bool, &c.diagnostic_lock, .Xchg, true, .unordered)) {
+        fn fail(c: *Check, m: *Manifest, diagnostic: Diagnostic) error{CacheCheckFailed} {
+            if (!@atomicRmw(bool, &c.diagnostic_lock, .Xchg, true, .monotonic)) {
                 m.diagnostic = diagnostic;
             }
+            return error.CacheCheckFailed;
         }
     };
 
     pub const Files = std.array_hash_map.Custom(File.Offset, void, File.HashContext, false);
 
-    /// Source files whose prefix and relative path are included when computing
-    /// the cache manifest digest. It's the information needed to lazily hash
-    /// the input files only when a cache miss occurs.
+    /// Source files and directories whose prefix and relative path are
+    /// included when computing the cache manifest digest. It's the information
+    /// needed to lazily hash the input files only when a cache miss occurs.
     ///
     /// `File.prefix`, `File.path`, and `File.mode` will be always populated,
     /// but the other fields of `File` will be populated depending on the
-    /// fields of `InputFile`.
-    pub const InputFile = struct {
+    /// fields of `InputPath`.
+    pub const InputPath = struct {
         request_handle: bool,
         have_handle: bool,
         /// Determines whether `File.size`, `File.inode`, and `File.mtime` are populated.
@@ -360,7 +361,7 @@ pub const Manifest = struct {
         /// `have_handle` determines whether this is populated.
         handle: Io.File,
 
-        /// Index into `Manifest.input_files`.
+        /// Index into `Manifest.input_paths`.
         pub const Index = enum(u32) {
             _,
         };
@@ -406,13 +407,13 @@ pub const Manifest = struct {
         pub const Offset = enum(u32) {
             _,
 
-            pub fn get(offset: Offset, m: *const Manifest) *File {
-                return @ptrCast(m.contents.items[@backingInt(offset)..][0..@sizeOf(File)]);
+            pub fn get(offset: Offset, contents: []u8) *File {
+                return @ptrCast(@alignCast(contents.items[@backingInt(offset)..][0..@sizeOf(File)]));
             }
 
-            pub fn getFallible(offset: Offset, m: *const Manifest) error{EndOfStream}!*File {
-                if (@backingInt(offset) + @sizeOf(File) >= m.contents.len) return error.EndOfStream;
-                return get(offset, m);
+            pub fn getFallible(offset: Offset, contents: []u8) error{InvalidFormat}!*File {
+                if (@backingInt(offset) + @sizeOf(File) >= contents.items.len) return error.InvalidFormat;
+                return get(offset, contents);
             }
         };
 
@@ -431,25 +432,6 @@ pub const Manifest = struct {
                 return a.prefix == b.prefix and mem.eql(u8, a.path(), b.path());
             }
         };
-
-        pub fn path(file: *const File) [:0]const u8 {
-            return pathFallible(file) catch unreachable;
-        }
-
-        pub fn pathFallible(file: *const File) error{EndOfStream}![:0]const u8 {
-            const ptr: [*]u8 = &file.path_start;
-            const len = mem.findScalar(u8, ptr, 0) orelse return error.EndOfStream;
-            return ptr[0..len :0];
-        }
-
-        fn manifestDigestHash(file: *const File, hasher: *Hasher) void {
-            const path_ptr: [*]u8 = &file.path_start;
-            const path_len = mem.findScalar(u8, path_ptr, 0).?;
-            comptime assert(@offsetOf(File, "path_start") - @offsetOf(File, "flags") == 1);
-            // Includes flags and sentinel.
-            const hash_string = (path_ptr - 1)[0 .. path_len + 2];
-            hasher.update(hash_string);
-        }
 
         fn setStat(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!void {
             file.size = stat.size;
@@ -490,6 +472,16 @@ pub const Manifest = struct {
         pub const FileOp = struct {
             file_offset: File.Offset,
             err: anyerror,
+
+            /// Returned `Path` references `Manifest.contents`.
+            pub fn path(fo: FileOp, manifest: *const Manifest) Path {
+                const contents = manifest.contents.items;
+                const prefix = fo.file_offset.get(contents).flags.prefix;
+                return .{
+                    .root_dir = manifest.cache.prefixes()[prefix],
+                    .sub_path = filePath(contents, fo.file_offset),
+                };
+            }
         };
     };
 
@@ -499,42 +491,49 @@ pub const Manifest = struct {
         mtime: Io.Timestamp,
     };
 
-    pub const AddInputFileOptions = struct {
-        /// If `is_directory` is true, this handle must be opened with
-        /// iteration capability.
-        handle: ?Io.File = null,
+    pub const PathHandle = union(enum) {
+        file: ?Io.File,
+        /// If provided, this handle must be opened with iteration capability.
+        dir: ?Io.Dir,
+    };
+
+    pub const AddInputPathOptions = struct {
+        handle: PathHandle = .{ .file = null },
         stat: ?Stat = null,
         request_handle: bool = false,
-        /// Can request file or directory contents depending on `is_directory`.
+        /// Can request file or directory contents depending on `handle`.
         request_contents: bool = false,
-        /// Contents of a directory are considered to be the sorted list of
-        /// file names of direct entries, separated by null byte. Each file name
-        /// is prefixed by `Io.File.Kind` byte, +1 so that the zero tag is
-        /// not aliased by the entry separator.
-        is_directory: bool = false,
         /// Content hashing skipped; any difference in metadata implies cache
         /// miss.
         metadata_only: bool = false,
     };
 
-    pub const AddInputFileError = error{
+    pub const AddInputPathError = error{
         /// The same file path has been added to the cache manifest both as a
         /// directory and as a normal file, making the intended caching
         /// behavior ambiguous.
         IsDirectoryAmbiguous,
     } || Allocator.Error;
 
-    /// Add a file as a dependency of process being cached. When `hit` is
-    /// called, the file's contents will be checked to ensure that it matches
-    /// the contents from previous times.
+    /// Add a file or directory path as a dependency of process being cached.
+    /// When `hit` is called, the contents will be checked to ensure
+    /// that it matches the contents from previous times.
     ///
     /// The contents of the input file may be requested and subsequently
-    /// obtained via methods of the returned `InputFile.Index` after calling
+    /// obtained via methods of the returned `InputPath.Index` after calling
     /// `hit`.
-    pub fn addInputFile(m: *Manifest, path: Path, options: AddInputFileOptions) Allocator.Error!InputFile.Index {
+    ///
+    /// Contents of a directory are considered to be the sorted list of file
+    /// names of direct entries, separated by null byte. Each file name is
+    /// prefixed by `Io.File.Kind` byte, +1 so that the zero tag is not aliased
+    /// by the entry separator.
+    ///
+    /// See also:
+    /// * `addPathPost`
+    pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) AddInputPathError!InputPath.Index {
         const gpa = m.cache.gpa;
         try m.files.ensureUnusedCapacity(gpa, 1);
-        try m.input_files.ensureUnusedCapacity(gpa, 1);
+        try m.input_paths.ensureUnusedCapacity(gpa, 1);
 
         const prev_contents_len = m.contents.items.len;
         const header: *File = @ptrCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File)));
@@ -558,7 +557,7 @@ pub const Manifest = struct {
         });
         if (gop.found_existing) {
             m.contents.shrinkRetainingCapacity(prev_contents_len);
-            const existing_input_file = &m.input_files.items[gop.index];
+            const existing_input_file = &m.input_paths.items[gop.index];
             if (options.handle) |handle| {
                 existing_input_file.handle = handle;
                 existing_input_file.have_handle = true;
@@ -579,7 +578,7 @@ pub const Manifest = struct {
             if (!options.metadata_only)
                 existing_header.flags.metadata_only = false;
         } else {
-            m.input_files.appendAssumeCapacity(.{
+            m.input_paths.appendAssumeCapacity(.{
                 .request_handle = options.request_handle,
                 .have_handle = options.handle != null,
                 .handle = if (options.handle) |handle| handle else undefined,
@@ -587,7 +586,7 @@ pub const Manifest = struct {
                 .have_digest = false,
                 .have_stat = options.stat != null,
             });
-            assert(m.input_files.items.len - 1 == gop.index);
+            assert(m.input_paths.items.len - 1 == gop.index);
             if (options.stat) |stat| {
                 header.size = stat.size;
                 header.inode = stat.inode;
@@ -597,9 +596,9 @@ pub const Manifest = struct {
         return @fromBackingInt(gop.index);
     }
 
-    pub fn addInputFileOptional(m: *Manifest, opt_path: ?Path, options: AddInputFileOptions) Allocator.Error!void {
+    pub fn addInputFileOptional(m: *Manifest, opt_path: ?Path, options: AddInputPathOptions) Allocator.Error!void {
         m.hash.add(opt_path != null);
-        _ = try addInputFile(m, opt_path orelse return, options);
+        _ = try addInputPath(m, opt_path orelse return, options);
     }
 
     /// Check the cache to see if the input exists in it.
@@ -623,8 +622,8 @@ pub const Manifest = struct {
     pub fn checkProgressless(man: *Manifest) Check.Error!Check.Status {
         assert(man.manifest_file == null);
 
-        for (man.files.keys()[0..man.input_files.items.len]) |file_off| {
-            file_off.get(man).manifestDigestHash(&man.hash.hasher);
+        for (man.files.keys()[0..man.input_paths.items.len]) |file_off| {
+            man.digestHash(file_off, &man.hash.hasher);
         }
 
         man.diagnostic = .none;
@@ -709,16 +708,16 @@ pub const Manifest = struct {
 
         // We're going to construct a second hash. Its input will begin with the digest we've
         // already computed (`bin_digest`), and then it'll have the digests of each input file,
-        // including "post" files (see `addFilePost`). If this is a hit, we learn the set of "post"
+        // including "post" files (see `addPathPost`). If this is a hit, we learn the set of "post"
         // files from the manifest on disk. If this is a miss, we'll learn those from future calls
-        // to `addFilePost` etc. As such, the state of `man.hash.hasher` after this function
+        // to `addPathPost` etc. As such, the state of `man.hash.hasher` after this function
         // depends on whether this is a hit or a miss.
         //
         // If we return `CacheStatus.hit`, then `man.hash.hasher` must already include
         // the digests of the "post" files, so the caller can call `final`. Otherwise, on a cache
         // miss, `man.hash.hasher` will include the digests of all non-"post" files -- that is,
         // the ones we've already been told about. The rest will be discovered through calls to
-        // `addFilePost` etc, which will update the hasher. After all files are added, the user can
+        // `addPathPost` etc, which will update the hasher. After all files are added, the user can
         // use `final`, and will at some point `writeManifest` the file list to disk.
 
         man.hash.hasher = hasher_init;
@@ -762,11 +761,11 @@ pub const Manifest = struct {
     }
 
     fn shrinkFilesToInput(m: *Manifest) void {
-        if (m.files.count() <= m.input_files.items.len) return;
-        const off = m.files.keys()[m.input_files.items.len];
+        if (m.files.count() <= m.input_paths.items.len) return;
+        const off = m.files.keys()[m.input_paths.items.len];
         m.contents.shrinkRetainingCapacity(@backingInt(off));
-        assert(m.contents.len % @alignOf(File) == 0);
-        m.files.shrinkRetainingCapacity(m.input_files.items.len);
+        assert(m.contents.items.len % @alignOf(File) == 0);
+        m.files.shrinkRetainingCapacity(m.input_paths.items.len);
     }
 
     /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
@@ -784,59 +783,70 @@ pub const Manifest = struct {
                 return error.CacheCheckFailed;
             },
         };
+        const contents = m.contents.items;
 
-        // Guess number of files based on manifest contents len to reduce allocations.
-        try m.files.ensureUnusedCapacity(gpa, m.contents.len / (@sizeOf(File) + 32));
+        var off: u32 = 0;
+        var c: Check = .{};
 
-        var file_index: usize = 0;
-        var off: usize = 0;
-
-        // This group we always want to compute the hash digests, even on a cache miss.
+        // This group we always want to compute the hash digests, even on a
+        // cache miss, because they will be used in the manifest digest.
         var input_group: Io.Group = .init;
         defer input_group.cancel(io);
+
+        // First the input files section, which must match our input files,
+        // otherwise it's invalid format.
+        for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len]) |*input_path, input_file_off| {
+            if (off + 1 >= contents.len) return error.InvalidFormat;
+            const file_off: File.Offset = @fromBackingInt(off);
+            const file = try file_off.getFallible(contents);
+            if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
+            const path = try filePathFallible(contents, file_off);
+            if (path.len == 0) return error.InvalidFormat;
+            if (input_file_off != file_off) return error.InvalidFormat;
+
+            input_group.async(io, checkInputFile, .{ m, &c, file_off, path, input_path });
+
+            off = @intCast(@as(usize, off) + @sizeOf(File) + path.len + 1);
+        }
+
+        // Guess number of files based on manifest contents len to reduce allocations.
+        // This is not an upper bound; subsequent insertions may potentially allocate.
+        try m.files.ensureUnusedCapacity(gpa, contents.len / (@sizeOf(File) + 32));
 
         // This group we would like to cancel as soon as a cache miss is discovered.
         const PostResult = union(enum) {
             checkFile: Check.Status,
         };
         var post_select_buffer: [10]PostResult = undefined;
-        var post_select: Io.Select(PostResult) = .init(&post_select_buffer);
+        var post_select: Io.Select(PostResult) = .init(io, &post_select_buffer);
         var post_select_remaining: usize = 0;
-        var c: Check = .{};
-        defer post_select.cancel(io);
+        defer post_select.cancelDiscard();
 
-        while (off + 1 < m.contents.len) {
+        while (off + 1 < contents.len) {
             const file_off: File.Offset = @fromBackingInt(off);
-            const file = try File.getFallible(file_off, m);
+            const file = try file_off.getFallible(m);
             if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
-            const path = try file.pathFallible();
+            const path = try filePathFallible(contents, file_off);
             if (path.len == 0) return error.InvalidFormat;
 
-            if (file_index < m.input_files.items.len) {
-                if (m.files.keys()[file_index] != file_off) return error.InvalidFormat;
+            try m.files.put(gpa, file_off, {});
 
-                input_group.async(io, checkInputFile, .{ m, &c, file_off, path });
-            } else {
-                try m.files.put(gpa, file_off);
+            post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
+            post_select_remaining += 1;
 
-                post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
-                post_select_remaining += 1;
-            }
-
-            file_index += 1;
-            off += @sizeOf(File) + path.len + 1;
+            off = @intCast(@as(usize, off) + @sizeOf(File) + path.len + 1);
         }
 
         // Final terminating zero byte to distinguish empty manifest file from
         // manifest with zero files.
-        const file_valid = off + 1 == m.contents.len and m.contents[off] == 0;
-        if (!file_valid or file_index < m.input_files.items.len) {
+        const file_valid = off + 1 == contents.len and contents[off] == 0;
+        if (!file_valid) {
             try input_group.await(io);
             return .miss;
         }
 
         // Don't track the trailing zero byte in contents.
-        m.contents.len -= 1;
+        m.contents.items.len -= 1;
 
         var post_await_buffer: [10]PostResult = undefined;
         while (post_select_remaining > 0) {
@@ -880,11 +890,17 @@ pub const Manifest = struct {
         return .hit;
     }
 
-    fn checkInputFile(m: *Manifest, c: *Check, file_off: File.Offset, file_path: [:0]const u8) Io.Cancelable!void {
-        // TODO use already open handle
-        // TODO use already provided stat
-        // TODO implement request_handle
-        // TODO implement request_contents
+    fn checkInputFile(
+        m: *Manifest,
+        c: *Check,
+        file_off: File.Offset,
+        file_path: [:0]const u8,
+        input_path: *InputPath,
+    ) Io.Cancelable!void {
+        if (input_path.have_handle) @panic("TODO");
+        if (input_path.have_stat) @panic("TODO");
+        if (input_path.contents != .not_requested) @panic("TODO");
+        if (input_path.request_handle) @panic("TODO");
         switch (try checkFile(m, c, file_off, file_path)) {
             .hit => return,
             .miss => @atomicStore(Check.Status, &c.status, .miss, .unordered),
@@ -897,7 +913,7 @@ pub const Manifest = struct {
         c: *Check,
         file_off: File.Offset,
         file_path: [:0]const u8,
-    ) Io.Cancelable!Check.Status {
+    ) error{ Canceled, CacheCheckFailed }!Check.Status {
         const file = file_off.get(m);
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -905,7 +921,7 @@ pub const Manifest = struct {
         const parent_dir = cache.prefixes()[file.flags.prefix].handle;
 
         if (file.flags.metadata_only) {
-            const actual_stat = parent_dir.statFile() catch |err| switch (err) {
+            const actual_stat = parent_dir.statFile(io, file_path, .{}) catch |err| switch (err) {
                 error.FileNotFound => return .miss,
                 error.Canceled => |e| return e,
                 else => |e| return c.fail(m, .{ .file_stat = .{
@@ -999,10 +1015,10 @@ pub const Manifest = struct {
     /// not including post files).
     ///
     /// Assumes that `bin_digest` is populated for all input files.
-    pub fn unhit(man: *Manifest, bin_digest: BinDigest) void {
+    pub fn unhit(man: *Manifest, bin_digest: *const BinDigest) void {
         // Reset the hash.
         man.hash.hasher = hasher_init;
-        man.hash.hasher.update(&bin_digest);
+        man.hash.hasher.update(bin_digest);
         man.shrinkFilesToInput();
         for (man.files.keys()) |off| {
             const file = off.get(man);
@@ -1053,11 +1069,8 @@ pub const Manifest = struct {
         return timestamp.nanoseconds >= man.recent_problematic_timestamp.nanoseconds;
     }
 
-    pub const AddFilePostOptions = struct {
-        handle: union(enum) {
-            file: ?Io.File,
-            dir: ?Io.Dir,
-        } = .{ .file = null },
+    pub const AddPathPostOptions = struct {
+        handle: PathHandle = .{ .file = null },
         stat: ?Stat = null,
         /// If it is a directory, there is a special encoding required for contents, which
         /// is null-separated sorted entries, each one prefixed with `File.Kind`.
@@ -1065,7 +1078,7 @@ pub const Manifest = struct {
         metadata_only: bool = false,
     };
 
-    pub const AddFilePostError = error{
+    pub const AddPathPostError = error{
         /// The same file path has been added to the cache manifest both as a
         /// directory and as a normal file, making the intended caching
         /// behavior ambiguous.
@@ -1074,7 +1087,10 @@ pub const Manifest = struct {
 
     /// Add a file as a dependency of process being cached, after cache miss
     /// occurs.
-    pub fn addFilePost(m: *Manifest, path: Path, options: AddFilePostOptions) AddFilePostError!void {
+    ///
+    /// See also:
+    /// * `addInputPath`
+    pub fn addPathPost(m: *Manifest, path: Path, options: AddPathPostOptions) AddPathPostError!void {
         assert(m.manifest_file != null);
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -1236,14 +1252,14 @@ pub const Manifest = struct {
                 // Clang is invoked in single-source mode but other programs may not
                 .target, .target_must_resolve => {},
                 .prereq => |file_path| if (self.manifest_file == null) {
-                    _ = try self.addFilePath(.initCwd(file_path), null);
-                } else try self.addFilePost(file_path),
+                    _ = try self.addInputPath(.initCwd(file_path), .{});
+                } else try self.addPathPost(file_path),
                 .prereq_must_resolve => {
                     resolve_buf.clearRetainingCapacity();
                     try token.resolve(gpa, &resolve_buf);
                     if (self.manifest_file == null) {
-                        _ = try self.addFilePath(.initCwd(resolve_buf.items), null);
-                    } else try self.addFilePost(resolve_buf.items);
+                        _ = try self.addInputPath(.initCwd(resolve_buf.items), .{});
+                    } else try self.addPathPost(resolve_buf.items);
                 },
                 else => |err| {
                     try err.printError(gpa, &error_buf);
@@ -1336,25 +1352,45 @@ pub const Manifest = struct {
         return .{ .manifest_file = self.manifest_file.? };
     }
 
-    pub fn takeFiles(man: *Manifest) Files {
-        defer man.files = .empty;
-        return man.files;
-    }
+    pub const SelfContainedFiles = struct {
+        /// References memory inside `contents`.
+        files: Files,
+        contents: std.ArrayList(u8),
 
-    pub fn freeFiles(gpa: Allocator, files: *Files) void {
-        for (files.keys()) |*file| file.deinit(gpa);
-        files.deinit(gpa);
+        pub const empty: @This() = .{
+            .files = .empty,
+            .contents = .empty,
+        };
+
+        pub fn deinit(scf: *SelfContainedFiles, gpa: Allocator) void {
+            scf.files.deinit(gpa);
+            scf.contents.deinit(gpa);
+            scf.* = undefined;
+        }
+
+        pub fn path(scf: *const SelfContainedFiles, file_offset: File.Offset) [:0]const u8 {
+            return filePath(scf.contents.items, file_offset);
+        }
+    };
+
+    pub fn takeFiles(m: *Manifest) SelfContainedFiles {
+        defer m.files = .empty;
+        defer m.contents = .empty;
+        return .{
+            .files = m.files,
+            .contents = m.contents,
+        };
     }
 
     /// Releases the manifest file and frees any memory the Manifest was using.
     /// `Manifest.hit` must be called first.
     ///
     /// Don't forget to call `writeManifest` before this!
-    pub fn deinit(man: *Manifest) void {
-        const io = man.cache.io;
-        const gpa = man.cache.gpa;
+    pub fn deinit(m: *Manifest) void {
+        const io = m.cache.io;
+        const gpa = m.cache.gpa;
 
-        if (man.manifest_file) |file| {
+        if (m.manifest_file) |file| {
             if (builtin.os.tag == .windows) {
                 // See Lock.release for why this is required on Windows
                 file.unlock(io);
@@ -1362,8 +1398,9 @@ pub const Manifest = struct {
 
             file.close(io);
         }
-        freeFiles(gpa, &man.files);
-        man.* = undefined;
+        m.files.deinit(gpa);
+        m.contents.deinit(gpa);
+        m.* = undefined;
     }
 
     pub fn populateFileSystemInputs(man: *Manifest, buf: *std.ArrayList(u8)) Allocator.Error!void {
@@ -1497,6 +1534,25 @@ pub const Manifest = struct {
         hasher.update(contents.items[contents_start..][0..contents_len]);
         hasher.final(bin_digest);
     }
+
+    fn digestHash(m: *const Manifest, off: File.Offset, hasher: *Hasher) void {
+        const contents = m.contents.items;
+        const flags_off = @offsetOf(File, "flags");
+        comptime assert(@offsetOf(File, "path_start") - flags_off == 1);
+        const hash_start = @backingInt(off) + flags_off;
+        const hash_end = mem.findScalarPos(u8, contents, hash_start, 0).?;
+        hasher.update(contents[hash_start..hash_end]);
+    }
+
+    fn filePathFallible(contents: []const u8, off: File.Offset) error{InvalidFormat}![:0]const u8 {
+        const path_start = @backingInt(off) + @offsetOf(File, "path_start");
+        const path_end = mem.findScalarPos(u8, contents, path_start, 0) orelse return error.InvalidFormat;
+        return contents[path_start..path_end :0];
+    }
+
+    fn filePath(contents: []const u8, off: File.Offset) [:0]const u8 {
+        return filePathFallible(contents, off) catch unreachable;
+    }
 };
 
 /// Create/Write a file, close it, then grab its stat.mtime timestamp.
@@ -1555,7 +1611,7 @@ test "cache file and then recall it" {
             ch.hash.add(true);
             ch.hash.add(@as(u16, 1234));
             ch.hash.addBytes("1234");
-            _ = try ch.addFilePath(.initCwd(temp_file), null);
+            _ = try ch.addInputPath(.initCwd(temp_file), .{});
 
             // There should be nothing in the cache
             try testing.expectEqual(false, try ch.hit(.none));
@@ -1570,7 +1626,7 @@ test "cache file and then recall it" {
             ch.hash.add(true);
             ch.hash.add(@as(u16, 1234));
             ch.hash.addBytes("1234");
-            _ = try ch.addFilePath(.initCwd(temp_file), null);
+            _ = try ch.addInputPath(.initCwd(temp_file), .{});
 
             // Cache hit! We just "built" the same file
             try testing.expect(try ch.hit(.none));
@@ -1623,7 +1679,7 @@ test "check that changing a file makes cache fail" {
             defer ch.deinit();
 
             ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addFilePath(.initCwd(temp_file), 100);
+            const temp_file_idx = try ch.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
 
             // There should be nothing in the cache
             try testing.expectEqual(false, try ch.hit(.none));
@@ -1642,7 +1698,7 @@ test "check that changing a file makes cache fail" {
             defer ch.deinit();
 
             ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addFilePath(.initCwd(temp_file), 100);
+            const temp_file_idx = try ch.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
 
             // A file that we depend on has been updated, so the cache should not contain an entry for it
             try testing.expectEqual(false, try ch.hit(.none));
@@ -1689,7 +1745,7 @@ test "no file inputs" {
         man.hash.addBytes("1234");
 
         // There should be nothing in the cache
-        try testing.expectEqual(false, try man.hit(.none));
+        try testing.expectEqual(false, try man.check(.none));
 
         digest1 = man.final();
 
@@ -1701,7 +1757,7 @@ test "no file inputs" {
 
         man.hash.addBytes("1234");
 
-        try testing.expect(try man.hit(.none));
+        try testing.expect(try man.check(.none));
         digest2 = man.final();
         try testing.expectEqual(false, man.have_exclusive_lock);
     }
@@ -1750,12 +1806,12 @@ test "Manifest with files added after initial hash work" {
             defer ch.deinit();
 
             ch.hash.addBytes("1234");
-            _ = try ch.addFilePath(.initCwd(temp_file1), null);
+            _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
             // There should be nothing in the cache
             try testing.expectEqual(false, try ch.hit(.none));
 
-            _ = try ch.addFilePost(temp_file2);
+            _ = try ch.addPathPost(temp_file2);
 
             digest1 = ch.final();
             try ch.writeManifest();
@@ -1765,7 +1821,7 @@ test "Manifest with files added after initial hash work" {
             defer ch.deinit();
 
             ch.hash.addBytes("1234");
-            _ = try ch.addFilePath(.initCwd(temp_file1), null);
+            _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
             try testing.expect(try ch.hit(.none));
             digest2 = ch.final();
@@ -1788,12 +1844,12 @@ test "Manifest with files added after initial hash work" {
             defer ch.deinit();
 
             ch.hash.addBytes("1234");
-            _ = try ch.addFilePath(.initCwd(temp_file1), null);
+            _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
             // A file that we depend on has been updated, so the cache should not contain an entry for it
             try testing.expectEqual(false, try ch.hit(.none));
 
-            _ = try ch.addFilePost(temp_file2);
+            _ = try ch.addPathPost(temp_file2);
 
             digest3 = ch.final();
 

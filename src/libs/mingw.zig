@@ -246,12 +246,12 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8, prog_node: std.P
     var man = cache.obtain();
     defer man.deinit();
 
-    _ = try man.addFilePath(def_file_path, null);
+    _ = try man.addInputPath(def_file_path, .{});
 
     const final_lib_basename = try std.fmt.allocPrint(gpa, "{s}.lib", .{lib_name});
     errdefer gpa.free(final_lib_basename);
 
-    const is_hit = man.hit(prog_node) catch |err| switch (err) {
+    const is_hit = man.check(prog_node) catch |err| switch (err) {
         error.CacheCheckFailed => switch (man.diagnostic) {
             .none => unreachable,
             .manifest_create, .manifest_read, .manifest_lock => |e| {

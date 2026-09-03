@@ -702,8 +702,8 @@ pub fn main(init: process.Init.Minimal) !void {
     configure: while (true) {
         // Set of files that, if modified, imply that recompiling and rerunning
         // configurer is needed.
-        var configure_source_files: Cache.Manifest.Files = .empty;
-        defer Cache.Manifest.freeFiles(gpa, &configure_source_files);
+        var configure_source_files: Cache.Manifest.SelfContainedFiles = .empty;
+        defer configure_source_files.deinit(gpa);
 
         // If this fails, we can still start the server and wait for user
         // to request a rebuild. If it returns error.FailedButCacheIntact
@@ -1043,7 +1043,7 @@ const ConfigureOptions = struct {
     fetch_only: bool,
     print_configuration: PrintConfiguration,
     forks: []Fork,
-    src_files: *Cache.Manifest.Files,
+    src_files: *Cache.Manifest.SelfContainedFiles,
 };
 
 fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
@@ -1398,7 +1398,7 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
             defer compile_prog_node.end();
 
             if (config_man) |man| {
-                if (try man.hit(compile_prog_node)) {
+                if (.hit == try man.check(compile_prog_node)) {
                     const digest = man.final();
                     const path: Path = .{
                         .root_dir = graph.local_cache_root,
@@ -1497,11 +1497,11 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
         }
 
         if (config_man) |man| for (configuration.path_deps) |path_dep| {
-            switch (path_dep.flags.mode) {
-                .directory => {}, // TODO
-                .contents => try man.addPathPost(try confPathDepToCachePath(arena, graph, &configuration, path_dep)),
-                .metadata => {}, // TODO
-            }
+            const path = try confPathDepToCachePath(arena, graph, &configuration, path_dep);
+            try man.addPathPost(path, .{
+                .handle = if (path_dep.flags.is_directory) .{ .dir = null } else .{ .file = null },
+                .metadata_only = path_dep.flags.metadata_only,
+            });
         };
 
         // If it is poisoned, there is no point in moving it to cached
@@ -2220,7 +2220,7 @@ fn resolveTopLevelSteps(maker: *Maker, step_names: []const []const u8) ![]const 
 fn prepare(
     maker: *Maker,
     step_indices: []const Configuration.Step.Index,
-    configure_source_files: *const Cache.Manifest.Files,
+    configure_source_files: *const Cache.Manifest.SelfContainedFiles,
 ) !void {
     const gpa = maker.gpa;
     const graph = maker.graph;

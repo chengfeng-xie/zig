@@ -795,10 +795,12 @@ pub const Manifest = struct {
 
     fn shrinkFilesToInput(m: *Manifest) void {
         if (m.files.count() <= m.input_paths.items.len) return;
+        // Reads from files hash map whose data is destroyed on the next line.
         const off = m.files.keys()[m.input_paths.items.len];
+        // Reads from the unshrunken contents whose data is destroyed on the next line.
+        m.files.shrinkRetainingCapacityContext(m.input_paths.items.len, .{ .contents = m.contents.items });
         m.contents.shrinkRetainingCapacity(@backingInt(off));
         assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
-        m.files.shrinkRetainingCapacityContext(m.input_paths.items.len, .{ .contents = m.contents.items });
     }
 
     /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
@@ -852,7 +854,7 @@ pub const Manifest = struct {
         const PostResult = union(enum) {
             checkFile: CheckFileError!Check.Status,
         };
-        var post_select_buffer: [10]PostResult = undefined;
+        var post_select_buffer: [16]PostResult = undefined;
         var post_select: Io.Select(PostResult) = .init(io, &post_select_buffer);
         var post_select_remaining: usize = 0;
         defer post_select.cancelDiscard();
@@ -866,8 +868,33 @@ pub const Manifest = struct {
 
             try m.files.putContext(gpa, file_off, {}, .{ .contents = contents });
 
-            post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
-            post_select_remaining += 1;
+            // In order to call async here we would need to ensure `post_select_buffer`
+            // has capacity for as many elements as files being checked. Since we don't want
+            // to dynamically allocate that buffer, we use concurrent + fallback here.
+            if (post_select.concurrent(.checkFile, checkFile, .{ m, &c, file_off, path })) |_| {
+                post_select_remaining += 1;
+            } else |err| switch (err) {
+                error.ConcurrencyUnavailable => {
+                    // Detect if input group already had a miss. In this case we still wait
+                    // for those digests to be updated, but cancel the non input group.
+                    switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
+                        .miss => {
+                            post_select.cancelDiscard();
+                            try input_group.await(io);
+                            return .miss;
+                        },
+                        .hit => {},
+                    }
+                    switch (try checkFile(m, &c, file_off, path)) {
+                        .hit => continue,
+                        .miss => {
+                            post_select.cancelDiscard();
+                            try input_group.await(io);
+                            return .miss;
+                        },
+                    }
+                },
+            }
 
             off += File.sizeOf(path.len);
         }
@@ -883,7 +910,7 @@ pub const Manifest = struct {
         // Don't track the trailing zero byte in contents.
         m.contents.items.len -= 1;
 
-        var post_await_buffer: [10]PostResult = undefined;
+        var post_await_buffer: [16]PostResult = undefined;
         while (post_select_remaining > 0) {
             const n = try post_select.awaitMany(&post_await_buffer, 1);
             post_select_remaining -= n;
@@ -896,11 +923,11 @@ pub const Manifest = struct {
                     try input_group.await(io);
                     return .miss;
                 },
-                .hit => continue,
+                .hit => {},
             }
 
             for (post_await_buffer[0..n]) |u| switch (u) {
-                .checkFile => |result| switch (result) {
+                .checkFile => |result| switch (try result) {
                     .hit => continue,
                     .miss => {
                         post_select.cancelDiscard();

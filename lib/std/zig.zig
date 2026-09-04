@@ -1838,7 +1838,7 @@ pub fn buildExeSubprocess(
                 while (it.next()) |prefixed_path| {
                     const prefix: Server.Message.PathPrefix = @fromBackingInt(@intCast(prefixed_path[0] - 1));
                     const sub_path = prefixed_path[1..];
-                    man.addPathPost(.{
+                    man.addDiscoveredPath(.{
                         .path = .{ .prefixed = .{
                             .prefix = @intCast(@backingInt(prefix)),
                             .sub_path = sub_path,

@@ -1498,7 +1498,7 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
 
         if (config_man) |man| for (configuration.path_deps) |path_dep| {
             const path = try confPathDepToCachePath(arena, graph, &configuration, path_dep);
-            try man.addPathPost(.{
+            try man.addDiscoveredPath(.{
                 .path = .{ .unresolved = path },
                 .handle = if (path_dep.flags.is_directory) .{ .dir = null } else .{ .file = null },
                 .metadata_only = path_dep.flags.metadata_only,

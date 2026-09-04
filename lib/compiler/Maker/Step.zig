@@ -787,7 +787,7 @@ pub fn writeManifestAndWatch(s: *Step, maker: *Maker, man: *Cache.Manifest) !voi
 }
 
 pub fn setWatchInputsFromManifest(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
-    return setWatchInputsFromManifestFiles(s, maker, &man.files, man.cache.prefixes());
+    return setWatchInputsFromManifestFiles(s, maker, &man.borrowFiles(), man.cache.prefixes());
 }
 
 pub fn setWatchInputsFromManifestFiles(

@@ -56,71 +56,60 @@ pub fn prefixes(cache: *const Cache) []const Directory {
     return cache.prefixes_buffer[0..cache.prefixes_len];
 }
 
-pub const PrefixedPath = struct {
-    prefix: u8,
+const PrefixIndex = u6;
+
+const PrefixedPath = struct {
+    prefix: PrefixIndex,
     sub_path: []const u8,
-
-    fn eql(a: PrefixedPath, b: PrefixedPath) bool {
-        return a.prefix == b.prefix and mem.eql(u8, a.sub_path, b.sub_path);
-    }
-
-    fn hash(pp: PrefixedPath) u32 {
-        return @truncate(std.hash.Wyhash.hash(pp.prefix, pp.sub_path));
-    }
 };
 
-fn findPrefixPath(cache: *const Cache, path: Path) !PrefixedPath {
-    const gpa = cache.gpa;
-    const resolved_path = try std.fs.path.resolve(gpa, &.{
-        cache.cwd, path.root_dir.path orelse ".", path.subPathOrDot(),
-    });
-    errdefer gpa.free(resolved_path);
-    return findPrefixResolved(cache, resolved_path);
+fn appendPrefixedPath(cache: *const Cache, contents: *std.ArrayList(u8), prefixed_path: PrefixedPath) !PrefixIndex {
+    const end = contents.items.len + prefixed_path.sub_path.len;
+    const needed_alignment = @alignOf(Manifest.File) - (end % @alignOf(Manifest.File));
+    assert(needed_alignment >= 1); // Always need at least a null byte.
+    try contents.ensureTotalCapacity(cache.gpa, end + needed_alignment);
+    contents.appendSliceAssumeCapacity(prefixed_path.sub_path);
+    contents.appendNTimesAssumeCapacity(0, needed_alignment);
+    return prefixed_path.prefix;
 }
 
-fn findPrefix(cache: *const Cache, file_path: []const u8) !PrefixedPath {
-    const gpa = cache.gpa;
-    const resolved_path = try std.fs.path.resolve(gpa, &.{file_path});
-    errdefer gpa.free(resolved_path);
-    return findPrefixResolved(cache, resolved_path);
-}
-
-/// Takes ownership of `resolved_path` on success.
-fn findPrefixResolved(cache: *const Cache, resolved_path: []u8) !PrefixedPath {
+fn resolveAppendPath(cache: *const Cache, contents: *std.ArrayList(u8), path: Path) !PrefixIndex {
     const gpa = cache.gpa;
     const cwd = cache.cwd;
+    const path_start = contents.items.len;
+
+    const resolved_path = try std.fs.path.resolveAlloc(gpa, &.{
+        path.root_dir.path orelse cwd,
+        path.subPathOrDot(),
+    });
+    defer gpa.free(resolved_path);
+
     for (cache.prefixes(), 0..) |prefix, i| {
-        const p = prefix.path orelse continue;
-        const sub_path = getPrefixSubpath(gpa, cwd, p, resolved_path) catch |err| switch (err) {
-            error.NotASubPath => continue,
-            else => |e| return e,
-        };
-        // Free the resolved path since we're not going to return it
-        gpa.free(resolved_path);
-        return .{
-            .prefix = @intCast(i),
-            .sub_path = sub_path,
-        };
+        const pp = prefix.path orelse continue;
+        contents.shrinkRetainingCapacity(path_start);
+        try std.fs.path.relativeAppend(gpa, contents, cwd, null, pp, resolved_path);
+        const relative = contents.items[path_start..];
+
+        var component_iterator: std.fs.path.NativeComponentIterator = .init(relative);
+        if (component_iterator.root() != null) continue;
+        const first_component = component_iterator.first();
+        if (first_component != null and mem.eql(u8, first_component.?.name, "..")) continue;
+
+        const needed_alignment = @alignOf(Manifest.File) - (contents.items.len % @alignOf(Manifest.File));
+        assert(needed_alignment >= 1); // Always need at least a null byte.
+        try contents.appendNTimes(gpa, 0, needed_alignment);
+
+        return @intCast(i);
     }
 
-    return .{
-        .prefix = 0,
-        .sub_path = resolved_path,
-    };
-}
+    contents.shrinkRetainingCapacity(path_start);
+    try contents.appendSlice(gpa, resolved_path);
 
-fn getPrefixSubpath(gpa: Allocator, cwd: []const u8, prefix: []const u8, path: []u8) ![]u8 {
-    const relative = try std.fs.path.relative(gpa, cwd, null, prefix, path);
-    errdefer gpa.free(relative);
-    var component_iterator: std.fs.path.NativeComponentIterator = .init(relative);
-    if (component_iterator.root() != null) {
-        return error.NotASubPath;
-    }
-    const first_component = component_iterator.first();
-    if (first_component != null and mem.eql(u8, first_component.?.name, "..")) {
-        return error.NotASubPath;
-    }
-    return relative;
+    const needed_alignment = @alignOf(Manifest.File) - (contents.items.len % @alignOf(Manifest.File));
+    assert(needed_alignment >= 1); // Always need at least a null byte.
+    try contents.appendNTimes(gpa, 0, needed_alignment);
+
+    return 0;
 }
 
 /// This is 128 bits - Even with 2^54 cache entries, the probably of a collision would be under 10^-6
@@ -359,7 +348,10 @@ pub const Manifest = struct {
             _,
         },
         /// `have_handle` determines whether this is populated.
-        handle: Io.File,
+        handle: union {
+            file: Io.File,
+            dir: Io.Dir,
+        },
 
         /// Index into `Manifest.input_paths`.
         pub const Index = enum(u32) {
@@ -383,7 +375,7 @@ pub const Manifest = struct {
         pub const Flags = packed struct(u8) {
             is_directory: bool,
             metadata_only: bool,
-            prefix: u6,
+            prefix: PrefixIndex,
         };
 
         /// Prefixes path names in encoded directory contents. Starts numbering
@@ -408,40 +400,49 @@ pub const Manifest = struct {
             _,
 
             pub fn get(offset: Offset, contents: []u8) *File {
-                return @ptrCast(@alignCast(contents.items[@backingInt(offset)..][0..@sizeOf(File)]));
+                return @constCast(getConst(offset, contents));
+            }
+
+            pub fn getConst(offset: Offset, contents: []const u8) *const File {
+                return @ptrCast(@alignCast(contents[@backingInt(offset)..][0..@sizeOf(File)]));
             }
 
             pub fn getFallible(offset: Offset, contents: []u8) error{InvalidFormat}!*File {
-                if (@backingInt(offset) + @sizeOf(File) >= contents.items.len) return error.InvalidFormat;
+                if (@backingInt(offset) + @sizeOf(File) >= contents.len) return error.InvalidFormat;
                 return get(offset, contents);
             }
         };
 
+        /// Intentionally matches if the files are different only by flags other than prefix.
         pub const HashContext = struct {
-            manifest: *const Manifest,
+            contents: []const u8,
 
             pub fn hash(this: @This(), off: Offset) u32 {
-                const file = off.get(this.manifest);
-                return @truncate(std.hash.Wyhash.hash(file.prefix, file.path()));
+                const file_prefix = off.getConst(this.contents).flags.prefix;
+                const file_path = filePath(this.contents, off);
+                return @truncate(std.hash.Wyhash.hash(file_prefix, file_path));
             }
 
             pub fn eql(this: @This(), a_off: Offset, b_off: Offset, b_index: usize) bool {
                 _ = b_index;
-                const a = a_off.get(this.manifest);
-                const b = b_off.get(this.manifest);
-                return a.prefix == b.prefix and mem.eql(u8, a.path(), b.path());
+                const a_prefix = a_off.getConst(this.contents).flags.prefix;
+                const b_prefix = b_off.getConst(this.contents).flags.prefix;
+                if (a_prefix != b_prefix) return false;
+                const a_path = filePath(this.contents, a_off);
+                const b_path = filePath(this.contents, b_off);
+                return mem.eql(u8, a_path, b_path);
             }
         };
 
         fn setStat(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!void {
             file.size = stat.size;
             file.inode = stat.inode;
-            file.mtime = stat.mtime;
+            file.mtime = @intCast(stat.mtime.toNanoseconds());
 
             if (try m.isProblematicTimestamp(stat.mtime)) {
                 // The actual file has an unreliable timestamp; force it to be hashed.
-                file.stat.mtime = 0;
-                file.stat.inode = 0;
+                file.mtime = 0;
+                file.inode = 0;
             }
         }
 
@@ -453,7 +454,7 @@ pub const Manifest = struct {
             {
                 return false;
             } else {
-                setStat(file, m, stat);
+                try setStat(file, m, stat);
                 return true;
             }
         }
@@ -489,12 +490,31 @@ pub const Manifest = struct {
         size: u64,
         inode: Io.File.INode,
         mtime: Io.Timestamp,
+
+        pub fn init(other: Io.File.Stat) Stat {
+            return .{
+                .size = other.size,
+                .inode = other.inode,
+                .mtime = other.mtime,
+            };
+        }
     };
 
     pub const PathHandle = union(enum) {
         file: ?Io.File,
         /// If provided, this handle must be opened with iteration capability.
         dir: ?Io.Dir,
+
+        pub fn isDirectory(this: @This()) bool {
+            return this == .dir;
+        }
+
+        pub fn have(this: @This()) bool {
+            return switch (this) {
+                .file => |opt_file| opt_file != null,
+                .dir => |opt_dir| opt_dir != null,
+            };
+        }
     };
 
     pub const AddInputPathOptions = struct {
@@ -524,59 +544,73 @@ pub const Manifest = struct {
     /// See also:
     /// * `addPathPost`
     pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) Allocator.Error!InputPath.Index {
-        const gpa = m.cache.gpa;
-        try m.files.ensureUnusedCapacity(gpa, 1);
+        const cache = m.cache;
+        const gpa = cache.gpa;
+        try m.files.ensureUnusedCapacityContext(gpa, 1, .{ .contents = m.contents.items });
         try m.input_paths.ensureUnusedCapacity(gpa, 1);
 
         const prev_contents_len = m.contents.items.len;
-        const header: *File = @ptrCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File)));
+        const header: *File = @ptrCast(@alignCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File))));
         errdefer m.contents.shrinkRetainingCapacity(prev_contents_len);
 
         header.* = .{
             .flags = .{
-                .prefix = try m.cache.findAppendPrefixedPath(&m.contents, path),
-                .is_directory = options.is_directory,
+                .prefix = try cache.resolveAppendPath(&m.contents, path),
+                .is_directory = options.handle.isDirectory(),
                 .metadata_only = options.metadata_only,
             },
             .size = undefined,
             .inode = undefined,
             .mtime = undefined,
             .digest = undefined,
+            .path_start = .{},
         };
-        assert(m.contents.items.len % @alignOf(File) == 0);
+        assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
 
-        const gop = try m.files.getOrPutAssumeCapacityContext(@fromBackingInt(prev_contents_len), .{
-            .manifest = m,
+        const gop = m.files.getOrPutAssumeCapacityContext(@fromBackingInt(@intCast(prev_contents_len)), .{
+            .contents = m.contents.items,
         });
+        m.files.lockPointers();
+        defer m.files.unlockPointers();
+
         if (gop.found_existing) {
             m.contents.shrinkRetainingCapacity(prev_contents_len);
             const existing_input_file = &m.input_paths.items[gop.index];
-            if (options.handle) |handle| {
-                existing_input_file.handle = handle;
-                existing_input_file.have_handle = true;
+            switch (options.handle) {
+                .file => |opt_file| if (opt_file) |file| {
+                    existing_input_file.handle = .{ .file = file };
+                    existing_input_file.have_handle = true;
+                },
+                .dir => |opt_dir| if (opt_dir) |dir| {
+                    existing_input_file.handle = .{ .dir = dir };
+                    existing_input_file.have_handle = true;
+                },
             }
             if (options.request_contents) switch (existing_input_file.contents) {
                 .requested, .not_requested => existing_input_file.contents = .requested,
                 _ => {},
             };
-            const existing_header = &m.files.keys()[gop.index];
+            const existing_header = m.files.keys()[gop.index].get(m.contents.items);
             if (options.stat) |stat| {
                 existing_input_file.have_stat = true;
                 existing_header.size = stat.size;
                 existing_header.inode = stat.inode;
-                existing_header.mtime = stat.mtime;
+                existing_header.mtime = @intCast(stat.mtime.toNanoseconds());
             }
             // If it trips, the same file path has been added to the cache
             // manifest both as a directory and as a normal file, making the
             // intended caching behavior ambiguous.
-            assert(existing_header.flags.is_directory == options.is_directory);
+            assert(existing_header.flags.is_directory == options.handle.isDirectory());
             if (!options.metadata_only)
                 existing_header.flags.metadata_only = false;
         } else {
             m.input_paths.appendAssumeCapacity(.{
                 .request_handle = options.request_handle,
-                .have_handle = options.handle != null,
-                .handle = if (options.handle) |handle| handle else undefined,
+                .have_handle = options.handle.have(),
+                .handle = switch (options.handle) {
+                    .file => |opt_file| if (opt_file) |file| .{ .file = file } else undefined,
+                    .dir => |opt_dir| if (opt_dir) |dir| .{ .dir = dir } else undefined,
+                },
                 .contents = if (options.request_contents) .requested else .not_requested,
                 .have_digest = false,
                 .have_stat = options.stat != null,
@@ -585,10 +619,10 @@ pub const Manifest = struct {
             if (options.stat) |stat| {
                 header.size = stat.size;
                 header.inode = stat.inode;
-                header.mtime = stat.mtime;
+                header.mtime = @intCast(stat.mtime.toNanoseconds());
             }
         }
-        return @fromBackingInt(gop.index);
+        return @fromBackingInt(@intCast(gop.index));
     }
 
     pub fn addInputFileOptional(m: *Manifest, opt_path: ?Path, options: AddInputPathOptions) Allocator.Error!void {
@@ -759,8 +793,8 @@ pub const Manifest = struct {
         if (m.files.count() <= m.input_paths.items.len) return;
         const off = m.files.keys()[m.input_paths.items.len];
         m.contents.shrinkRetainingCapacity(@backingInt(off));
-        assert(m.contents.items.len % @alignOf(File) == 0);
-        m.files.shrinkRetainingCapacity(m.input_paths.items.len);
+        assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
+        m.files.shrinkRetainingCapacityContext(m.input_paths.items.len, .{ .contents = m.contents.items });
     }
 
     /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
@@ -806,11 +840,13 @@ pub const Manifest = struct {
 
         // Guess number of files based on manifest contents len to reduce allocations.
         // This is not an upper bound; subsequent insertions may potentially allocate.
-        try m.files.ensureUnusedCapacity(gpa, contents.len / (@sizeOf(File) + 32));
+        try m.files.ensureUnusedCapacityContext(gpa, contents.len / (@sizeOf(File) + 32), .{
+            .contents = contents,
+        });
 
         // This group we would like to cancel as soon as a cache miss is discovered.
         const PostResult = union(enum) {
-            checkFile: Check.Status,
+            checkFile: CheckFileError!Check.Status,
         };
         var post_select_buffer: [10]PostResult = undefined;
         var post_select: Io.Select(PostResult) = .init(io, &post_select_buffer);
@@ -819,12 +855,12 @@ pub const Manifest = struct {
 
         while (off + 1 < contents.len) {
             const file_off: File.Offset = @fromBackingInt(off);
-            const file = try file_off.getFallible(m);
+            const file = try file_off.getFallible(contents);
             if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
             const path = try filePathFallible(contents, file_off);
             if (path.len == 0) return error.InvalidFormat;
 
-            try m.files.put(gpa, file_off, {});
+            try m.files.putContext(gpa, file_off, {}, .{ .contents = contents });
 
             post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
             post_select_remaining += 1;
@@ -867,19 +903,19 @@ pub const Manifest = struct {
                         try input_group.await(io);
                         return .miss;
                     },
-                    .fail => |diagnostic| {
-                        m.diagnostic = diagnostic;
-                        return error.CacheCheckFailed;
-                    },
                 },
             };
         }
 
         try input_group.await(io);
         if (c.status == .miss) return .miss;
+        if (m.diagnostic != .none) return error.CacheCheckFailed;
+
+        // Needed due to the length mutation above.
+        const refreshed_contents = m.contents.items;
 
         for (m.files.keys()) |file_off| {
-            m.hash.hasher.update(&file_off.get(m).digest);
+            m.hash.hasher.update(&file_off.get(refreshed_contents).digest);
         }
 
         return .hit;
@@ -896,11 +932,16 @@ pub const Manifest = struct {
         if (input_path.have_stat) @panic("TODO");
         if (input_path.contents != .not_requested) @panic("TODO");
         if (input_path.request_handle) @panic("TODO");
-        switch (try checkFile(m, c, file_off, file_path)) {
+        if (checkFile(m, c, file_off, file_path)) |status| switch (status) {
             .hit => return,
             .miss => @atomicStore(Check.Status, &c.status, .miss, .unordered),
+        } else |err| switch (err) {
+            error.CacheCheckFailed => assert(m.diagnostic != .none),
+            else => |e| return e,
         }
     }
+
+    const CheckFileError = error{ Canceled, CacheCheckFailed };
 
     /// Runs concurrently with other `checkFile`.
     fn checkFile(
@@ -908,8 +949,8 @@ pub const Manifest = struct {
         c: *Check,
         file_off: File.Offset,
         file_path: [:0]const u8,
-    ) error{ Canceled, CacheCheckFailed }!Check.Status {
-        const file = file_off.get(m);
+    ) CheckFileError!Check.Status {
+        const file = file_off.get(m.contents.items);
         const cache = m.cache;
         const gpa = cache.gpa;
         const io = cache.io;
@@ -928,7 +969,7 @@ pub const Manifest = struct {
             const actual_is_directory = actual_stat.kind == .directory;
             if (actual_is_directory != file.flags.is_directory) return .miss;
 
-            if (try file.setStatChanged(m, actual_stat)) return .miss;
+            if (try file.setStatChanged(m, .init(actual_stat))) return .miss;
 
             return .hit;
         }
@@ -954,7 +995,7 @@ pub const Manifest = struct {
                     .err = e,
                 } }),
             };
-            if (try file.setStatChanged(m, actual_stat)) {
+            if (try file.setStatChanged(m, .init(actual_stat))) {
                 const prev_digest: BinDigest = file.digest;
                 var contents: std.ArrayList(u8) = .empty;
                 defer contents.deinit(gpa);
@@ -989,7 +1030,7 @@ pub const Manifest = struct {
             } }),
         };
 
-        if (try file.setStatChanged(m, actual_stat)) {
+        if (try file.setStatChanged(m, .init(actual_stat))) {
             const prev_digest: BinDigest = file.digest;
             hashFile(io, opened_file, &file.digest) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -1015,8 +1056,9 @@ pub const Manifest = struct {
         man.hash.hasher = hasher_init;
         man.hash.hasher.update(bin_digest);
         man.shrinkFilesToInput();
+        const contents = man.contents.items;
         for (man.files.keys()) |off| {
-            const file = off.get(man);
+            const file = off.get(contents);
             man.hash.hasher.update(&file.digest);
         }
     }
@@ -1065,6 +1107,10 @@ pub const Manifest = struct {
     }
 
     pub const AddPathPostOptions = struct {
+        path: union(enum) {
+            unresolved: Path,
+            prefixed: PrefixedPath,
+        },
         handle: PathHandle = .{ .file = null },
         stat: ?Stat = null,
         /// If it is a directory, there is a special encoding required for contents, which
@@ -1073,29 +1119,30 @@ pub const Manifest = struct {
         metadata_only: bool = false,
     };
 
-    pub const AddPathPostError = Io.Cancelable || Allocator.Error;
-
     /// Add a file as a dependency of process being cached, after cache miss
     /// occurs.
     ///
     /// See also:
     /// * `addInputPath`
-    pub fn addPathPost(m: *Manifest, path: Path, options: AddPathPostOptions) AddPathPostError!void {
+    pub fn addPathPost(m: *Manifest, options: AddPathPostOptions) !void {
         assert(m.manifest_file != null);
         const cache = m.cache;
         const gpa = cache.gpa;
         const io = cache.io;
         const is_directory = options.handle == .dir;
 
-        try m.files.ensureUnusedCapacity(gpa, 1);
+        try m.files.ensureUnusedCapacityContext(gpa, 1, .{ .contents = m.contents.items });
 
-        const prev_contents_len = m.contents.items.len;
-        const new_header: *File = @ptrCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File)));
-        errdefer m.contents.shrinkRetainingCapacity(prev_contents_len);
+        const new_file_offset: File.Offset = @fromBackingInt(@intCast(m.contents.items.len));
+        const new_header: *File = @ptrCast(@alignCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File))));
+        errdefer m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
 
         new_header.* = .{
             .flags = .{
-                .prefix = try cache.findAppendPrefixedPath(&m.contents, path),
+                .prefix = switch (options.path) {
+                    .unresolved => |unresolved| try cache.resolveAppendPath(&m.contents, unresolved),
+                    .prefixed => |prefixed| try cache.appendPrefixedPath(&m.contents, prefixed),
+                },
                 .is_directory = is_directory,
                 .metadata_only = options.metadata_only,
             },
@@ -1103,31 +1150,32 @@ pub const Manifest = struct {
             .inode = undefined,
             .mtime = undefined,
             .digest = @splat(0),
+            .path_start = .{},
         };
-        assert(m.contents.items.len % @alignOf(File) == 0);
+        assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
 
-        const gop = m.files.getOrPutAssumeCapacity(@fromBackingInt(prev_contents_len), .{
-            .manifest = m,
+        const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{
+            .contents = m.contents.items,
         });
         m.files.lockPointers();
         defer m.files.unlockPointers();
 
-        const header = if (gop.found_existing) h: {
-            m.contents.shrinkRetainingCapacity(prev_contents_len);
+        const header, const file_offset = if (gop.found_existing) h: {
+            m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
             const existing_off = gop.key_ptr.*;
-            const header = existing_off.get(m);
+            const header = existing_off.get(m.contents.items);
             // If it trips, the same file path has been added to the cache
             // manifest both as a directory and as a normal file, making the
             // intended caching behavior ambiguous.
             assert(header.flags.is_directory == is_directory);
             if (!options.metadata_only)
                 header.flags.metadata_only = false;
-            break :h header;
-        } else new_header;
+            break :h .{ header, existing_off };
+        } else .{ new_header, new_file_offset };
 
         if (options.stat) |stat| {
             try header.setStat(m, stat);
-            if (header.metadata_only) {
+            if (header.flags.metadata_only) {
                 return;
             } else if (options.contents) |contents| {
                 var hasher = hasher_init;
@@ -1138,27 +1186,31 @@ pub const Manifest = struct {
         }
 
         const need_stat = options.stat == null;
+        const metadata_only = header.flags.metadata_only;
+        const prefix = header.flags.prefix;
 
         switch (options.handle) {
             .dir => |opt_handle| if (opt_handle) |handle| {
-                try populateDirectory(m, header, need_stat, handle, options.contents, header.metadata_only);
+                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only);
             } else {
-                const dir = cache.prefixes()[header.flags.prefix].handle;
-                const handle = try dir.openDir(io, header.path(), .{
+                const dir = cache.prefixes()[prefix].handle;
+                const sub_path = filePath(m.contents.items, file_offset);
+                const handle = try dir.openDir(io, sub_path, .{
                     .access_sub_paths = false,
                     .iterate = true,
                 });
                 defer handle.close(io);
-                try populateDirectory(m, header, need_stat, handle, options.contents, header.metadata_only);
+                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only);
             },
 
             .file => |opt_handle| if (opt_handle) |handle| {
-                try populateFile(m, header, need_stat, handle, options.contents, header.metadata_only);
+                try populateFile(m, header, need_stat, handle, options.contents, metadata_only);
             } else {
-                const dir = cache.prefixes()[header.flags.prefix].handle;
-                const handle = try dir.openFile(io, header.path(), .{ .mode = .read_only });
+                const dir = cache.prefixes()[prefix].handle;
+                const sub_path = filePath(m.contents.items, file_offset);
+                const handle = try dir.openFile(io, sub_path, .{ .mode = .read_only });
                 defer handle.close(io);
-                try populateFile(m, header, need_stat, handle, options.contents, header.metadata_only);
+                try populateFile(m, header, need_stat, handle, options.contents, metadata_only);
             },
         }
     }
@@ -1175,7 +1227,7 @@ pub const Manifest = struct {
 
         if (need_stat) {
             const stat = try handle.stat(io);
-            try file.setStat(m, stat);
+            try file.setStat(m, .init(stat));
         }
         if (metadata_only) return;
         if (contents) |bytes| {
@@ -1201,7 +1253,7 @@ pub const Manifest = struct {
 
         if (need_stat) {
             const stat = try handle.stat(io);
-            try file.setStat(m, stat);
+            try file.setStat(m, .init(stat));
         }
         if (metadata_only) return;
         if (contents) |bytes| {
@@ -1238,28 +1290,26 @@ pub const Manifest = struct {
         defer resolve_buf.deinit(gpa);
 
         var it: DepTokenizer = .{ .bytes = dep_file_contents };
-        while (it.next()) |token| {
-            switch (token) {
-                // We don't care about targets, we only want the prereqs
-                // Clang is invoked in single-source mode but other programs may not
-                .target, .target_must_resolve => {},
-                .prereq => |file_path| if (self.manifest_file == null) {
-                    _ = try self.addInputPath(.initCwd(file_path), .{});
-                } else try self.addPathPost(file_path),
-                .prereq_must_resolve => {
-                    resolve_buf.clearRetainingCapacity();
-                    try token.resolve(gpa, &resolve_buf);
-                    if (self.manifest_file == null) {
-                        _ = try self.addInputPath(.initCwd(resolve_buf.items), .{});
-                    } else try self.addPathPost(resolve_buf.items);
-                },
-                else => |err| {
-                    try err.printError(gpa, &error_buf);
-                    log.err("failed parsing {s}: {s}", .{ dep_file_sub_path, error_buf.items });
-                    return error.InvalidDepFile;
-                },
-            }
-        }
+        while (it.next()) |token| switch (token) {
+            // We don't care about targets, we only want the prereqs
+            // Clang is invoked in single-source mode but other programs may not
+            .target, .target_must_resolve => {},
+            .prereq => |file_path| if (self.manifest_file == null) {
+                _ = try self.addInputPath(.initCwd(file_path), .{});
+            } else try self.addPathPost(.{ .path = .{ .unresolved = .initCwd(file_path) } }),
+            .prereq_must_resolve => {
+                resolve_buf.clearRetainingCapacity();
+                try token.resolve(gpa, &resolve_buf);
+                if (self.manifest_file == null) {
+                    _ = try self.addInputPath(.initCwd(resolve_buf.items), .{});
+                } else try self.addPathPost(.{ .path = .{ .unresolved = .initCwd(resolve_buf.items) } });
+            },
+            else => |err| {
+                try err.printError(gpa, &error_buf);
+                log.err("failed parsing {s}: {s}", .{ dep_file_sub_path, error_buf.items });
+                return error.InvalidDepFile;
+            },
+        };
     }
 
     /// Returns a binary hash of the inputs.
@@ -1368,6 +1418,10 @@ pub const Manifest = struct {
     pub fn takeFiles(m: *Manifest) SelfContainedFiles {
         defer m.files = .empty;
         defer m.contents = .empty;
+        return borrowFiles(m);
+    }
+
+    pub fn borrowFiles(m: *const Manifest) SelfContainedFiles {
         return .{
             .files = m.files,
             .contents = m.contents,
@@ -1488,7 +1542,7 @@ pub const Manifest = struct {
         while (true) {
             const entries = entry_buffer[0..try reader.read(io, &entry_buffer)];
             for (try entries_list.addManyAsSlice(gpa, entries.len), entries) |*off, entry| {
-                off.* = contents.items.len;
+                off.* = @intCast(contents.items.len);
                 // As an optimization, make the reservation also count the duplication
                 // of the contents buffer that will be required after sorting.
                 try contents.ensureUnusedCapacity(gpa, (contents.items.len + entry.name.len + 2 - contents_start) * 2);

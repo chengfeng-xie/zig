@@ -348,7 +348,7 @@ fn addFromDirInner(
                 try filenames.append(ctx.arena, try ctx.arena.dupe(u8, entry.path));
             },
             .directory => {
-                b.dependOnDirectory(b.path(b.pathJoin(&.{ path_from_root, entry.path })));
+                b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ path_from_root, entry.path })));
             },
             else => continue,
         }

@@ -363,9 +363,9 @@ pub const Manifest = struct {
     pub const File = extern struct {
         size: u64,
         inode: u64,
-        digest: BinDigest,
         /// Nanoseconds.
         mtime: i64,
+        digest: BinDigest,
         /// Starting with this field and continuing into the path, excluding the null byte,
         /// is the string that is hashed for the manifest digest.
         flags: Flags,
@@ -546,35 +546,29 @@ pub const Manifest = struct {
     pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) Allocator.Error!InputPath.Index {
         const cache = m.cache;
         const gpa = cache.gpa;
+        const is_directory = options.handle.isDirectory();
+
         try m.files.ensureUnusedCapacityContext(gpa, 1, .{ .contents = m.contents.items });
         try m.input_paths.ensureUnusedCapacity(gpa, 1);
 
-        const prev_contents_len = m.contents.items.len;
-        const header: *File = @ptrCast(@alignCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File))));
-        errdefer m.contents.shrinkRetainingCapacity(prev_contents_len);
+        const new_file_offset: File.Offset = @fromBackingInt(@intCast(m.contents.items.len));
+        try m.contents.appendNTimes(gpa, 0, @offsetOf(File, "path_start"));
+        errdefer m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
 
-        header.* = .{
-            .flags = .{
-                .prefix = try cache.resolveAppendPath(&m.contents, path),
-                .is_directory = options.handle.isDirectory(),
-                .metadata_only = options.metadata_only,
-            },
-            .size = undefined,
-            .inode = undefined,
-            .mtime = undefined,
-            .digest = undefined,
-            .path_start = .{},
-        };
+        const new_prefix = try cache.resolveAppendPath(&m.contents, path);
         assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
+        new_file_offset.get(m.contents.items).flags = .{
+            .prefix = new_prefix,
+            .is_directory = is_directory,
+            .metadata_only = options.metadata_only,
+        };
 
-        const gop = m.files.getOrPutAssumeCapacityContext(@fromBackingInt(@intCast(prev_contents_len)), .{
-            .contents = m.contents.items,
-        });
+        const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{ .contents = m.contents.items });
         m.files.lockPointers();
         defer m.files.unlockPointers();
 
         if (gop.found_existing) {
-            m.contents.shrinkRetainingCapacity(prev_contents_len);
+            m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
             const existing_input_file = &m.input_paths.items[gop.index];
             switch (options.handle) {
                 .file => |opt_file| if (opt_file) |file| {
@@ -600,7 +594,7 @@ pub const Manifest = struct {
             // If it trips, the same file path has been added to the cache
             // manifest both as a directory and as a normal file, making the
             // intended caching behavior ambiguous.
-            assert(existing_header.flags.is_directory == options.handle.isDirectory());
+            assert(existing_header.flags.is_directory == is_directory);
             if (!options.metadata_only)
                 existing_header.flags.metadata_only = false;
         } else {
@@ -617,6 +611,7 @@ pub const Manifest = struct {
             });
             assert(m.input_paths.items.len - 1 == gop.index);
             if (options.stat) |stat| {
+                const header = new_file_offset.get(m.contents.items);
                 header.size = stat.size;
                 header.inode = stat.inode;
                 header.mtime = @intCast(stat.mtime.toNanoseconds());
@@ -1134,33 +1129,25 @@ pub const Manifest = struct {
         try m.files.ensureUnusedCapacityContext(gpa, 1, .{ .contents = m.contents.items });
 
         const new_file_offset: File.Offset = @fromBackingInt(@intCast(m.contents.items.len));
-        const new_header: *File = @ptrCast(@alignCast(try m.contents.addManyAsSlice(gpa, @sizeOf(File))));
+        try m.contents.appendNTimes(gpa, 0, @offsetOf(File, "path_start"));
         errdefer m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
 
-        new_header.* = .{
-            .flags = .{
-                .prefix = switch (options.path) {
-                    .unresolved => |unresolved| try cache.resolveAppendPath(&m.contents, unresolved),
-                    .prefixed => |prefixed| try cache.appendPrefixedPath(&m.contents, prefixed),
-                },
-                .is_directory = is_directory,
-                .metadata_only = options.metadata_only,
-            },
-            .size = undefined,
-            .inode = undefined,
-            .mtime = undefined,
-            .digest = @splat(0),
-            .path_start = .{},
+        const new_prefix = switch (options.path) {
+            .unresolved => |unresolved| try cache.resolveAppendPath(&m.contents, unresolved),
+            .prefixed => |prefixed| try cache.appendPrefixedPath(&m.contents, prefixed),
         };
         assert(mem.isAligned(m.contents.items.len, @alignOf(File)));
+        new_file_offset.get(m.contents.items).flags = .{
+            .prefix = new_prefix,
+            .is_directory = is_directory,
+            .metadata_only = options.metadata_only,
+        };
 
-        const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{
-            .contents = m.contents.items,
-        });
+        const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{ .contents = m.contents.items });
         m.files.lockPointers();
         defer m.files.unlockPointers();
 
-        const header, const file_offset = if (gop.found_existing) h: {
+        const file_offset = if (gop.found_existing) h: {
             m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
             const existing_off = gop.key_ptr.*;
             const header = existing_off.get(m.contents.items);
@@ -1170,8 +1157,10 @@ pub const Manifest = struct {
             assert(header.flags.is_directory == is_directory);
             if (!options.metadata_only)
                 header.flags.metadata_only = false;
-            break :h .{ header, existing_off };
-        } else .{ new_header, new_file_offset };
+            break :h existing_off;
+        } else new_file_offset;
+
+        const header = file_offset.get(m.contents.items);
 
         if (options.stat) |stat| {
             try header.setStat(m, stat);

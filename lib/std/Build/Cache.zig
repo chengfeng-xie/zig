@@ -297,7 +297,7 @@ pub const Manifest = struct {
     /// concatenated. Total byte size will be less than `max_input_content_len`
     /// otherwise an error is returned.
     ///
-    /// Data is invalidated when `addPathPost` is called.
+    /// Data is invalidated when `addDiscoveredPath` is called.
     all_input_content: std.ArrayList(u8) = .empty,
     max_input_content_len: usize = std.math.maxInt(u32),
 
@@ -542,7 +542,7 @@ pub const Manifest = struct {
     /// by the entry separator.
     ///
     /// See also:
-    /// * `addPathPost`
+    /// * `addDiscoveredPath`
     pub fn addInputPath(m: *Manifest, path: Path, options: AddInputPathOptions) Allocator.Error!InputPath.Index {
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -732,16 +732,16 @@ pub const Manifest = struct {
 
         // We're going to construct a second hash. Its input will begin with the digest we've
         // already computed (`bin_digest`), and then it'll have the digests of each input file,
-        // including "post" files (see `addPathPost`). If this is a hit, we learn the set of "post"
+        // including "post" files (see `addDiscoveredPath`). If this is a hit, we learn the set of "post"
         // files from the manifest on disk. If this is a miss, we'll learn those from future calls
-        // to `addPathPost` etc. As such, the state of `man.hash.hasher` after this function
+        // to `addDiscoveredPath` etc. As such, the state of `man.hash.hasher` after this function
         // depends on whether this is a hit or a miss.
         //
         // If we return `CacheStatus.hit`, then `man.hash.hasher` must already include
         // the digests of the "post" files, so the caller can call `final`. Otherwise, on a cache
         // miss, `man.hash.hasher` will include the digests of all non-"post" files -- that is,
         // the ones we've already been told about. The rest will be discovered through calls to
-        // `addPathPost` etc, which will update the hasher. After all files are added, the user can
+        // `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user can
         // use `final`, and will at some point `writeManifest` the file list to disk.
 
         man.hash.hasher = hasher_init;
@@ -1119,7 +1119,7 @@ pub const Manifest = struct {
     ///
     /// See also:
     /// * `addInputPath`
-    pub fn addPathPost(m: *Manifest, options: AddPathPostOptions) !void {
+    pub fn addDiscoveredPath(m: *Manifest, options: AddPathPostOptions) !void {
         assert(m.manifest_file != null);
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -1285,13 +1285,13 @@ pub const Manifest = struct {
             .target, .target_must_resolve => {},
             .prereq => |file_path| if (self.manifest_file == null) {
                 _ = try self.addInputPath(.initCwd(file_path), .{});
-            } else try self.addPathPost(.{ .path = .{ .unresolved = .initCwd(file_path) } }),
+            } else try self.addDiscoveredPath(.{ .path = .{ .unresolved = .initCwd(file_path) } }),
             .prereq_must_resolve => {
                 resolve_buf.clearRetainingCapacity();
                 try token.resolve(gpa, &resolve_buf);
                 if (self.manifest_file == null) {
                     _ = try self.addInputPath(.initCwd(resolve_buf.items), .{});
-                } else try self.addPathPost(.{ .path = .{ .unresolved = .initCwd(resolve_buf.items) } });
+                } else try self.addDiscoveredPath(.{ .path = .{ .unresolved = .initCwd(resolve_buf.items) } });
             },
             else => |err| {
                 try err.printError(gpa, &error_buf);
@@ -1846,7 +1846,7 @@ test "Manifest with files added after initial hash work" {
             // There should be nothing in the cache
             try testing.expectEqual(false, try ch.hit(.none));
 
-            _ = try ch.addPathPost(temp_file2);
+            _ = try ch.addDiscoveredPath(temp_file2);
 
             digest1 = ch.final();
             try ch.writeManifest();
@@ -1884,7 +1884,7 @@ test "Manifest with files added after initial hash work" {
             // A file that we depend on has been updated, so the cache should not contain an entry for it
             try testing.expectEqual(false, try ch.hit(.none));
 
-            _ = try ch.addPathPost(temp_file2);
+            _ = try ch.addDiscoveredPath(temp_file2);
 
             digest3 = ch.final();
 

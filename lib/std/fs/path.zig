@@ -867,6 +867,13 @@ pub const resolveWindows = resolveAllocWindows;
 /// Deprecated in favor of `resolveAllocPosix`.
 pub const resolvePosix = resolveAllocPosix;
 
+/// Deprecated in favor of `relativeAlloc`.
+pub const relative = relativeAlloc;
+/// Deprecated in favor of `relativeAllocPosix`.
+pub const relativePosix = relativeAllocPosix;
+/// Deprecated in favor of `relativeAllocWindows`.
+pub const relativeWindows = relativeAllocWindows;
+
 /// On Windows, calls `resolveAllocWindows`; otherwise calls `resolveAllocPosix`.
 pub fn resolveAlloc(gpa: Allocator, paths: []const []const u8) Allocator.Error![]u8 {
     switch (native_os) {
@@ -1536,7 +1543,7 @@ fn testBasenameWindows(input: []const u8, expected_output: []const u8) !void {
 ///
 /// See `relativePosix` and `relativeWindows` for operating system specific
 /// details and for how `environ_map` is used.
-pub fn relative(
+pub fn relativeAlloc(
     gpa: Allocator,
     cwd: []const u8,
     environ_map: ?*const std.process.Environ.Map,
@@ -1544,9 +1551,36 @@ pub fn relative(
     to: []const u8,
 ) Allocator.Error![]u8 {
     if (native_os == .windows) {
-        return relativeWindows(gpa, cwd, environ_map, from, to);
+        return relativeAllocWindows(gpa, cwd, environ_map, from, to);
     } else {
-        return relativePosix(gpa, cwd, from, to);
+        return relativeAllocPosix(gpa, cwd, from, to);
+    }
+}
+
+/// Appends the non-absolute path from `from` to `to` to the provided array
+/// list.
+///
+/// Other than modifying the provided array list, this is a pure function; the
+/// result solely depends on the input parameters and no file system operations
+/// are performed.
+///
+/// If `from` and `to` each resolve to the same path (after calling
+/// `resolveAppend` on each), a zero-length string is returned.
+///
+/// See `relativeAppendPosix` and `relativeAppendWindows` for operating system
+/// specific details and for how `environ_map` is used.
+pub fn relativeAppend(
+    gpa: Allocator,
+    al: *std.ArrayList(u8),
+    cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    from: []const u8,
+    to: []const u8,
+) Allocator.Error!void {
+    if (native_os == .windows) {
+        return relativeAppendWindows(gpa, al, cwd, environ_map, from, to);
+    } else {
+        return relativeAppendPosix(gpa, al, cwd, from, to);
     }
 }
 
@@ -1567,7 +1601,7 @@ pub fn relative(
 /// shell concept, so there's no guarantee that it'll be set or that it'll even
 /// be accurate. This is the only reason for the `environ_map` parameter. `null` is
 /// treated equivalent to the environment variable missing.
-pub fn relativeWindows(
+pub fn relativeAllocWindows(
     gpa: Allocator,
     cwd: []const u8,
     environ_map: ?*const std.process.Environ.Map,
@@ -1663,6 +1697,23 @@ pub fn relativeWindows(
     return [_]u8{};
 }
 
+pub fn relativeAppendWindows(
+    gpa: Allocator,
+    al: *std.ArrayList(u8),
+    cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    from: []const u8,
+    to: []const u8,
+) Allocator.Error!void {
+    _ = gpa;
+    _ = al;
+    _ = cwd;
+    _ = environ_map;
+    _ = from;
+    _ = to;
+    @panic("TODO");
+}
+
 fn windowsResolveAgainstCwd(
     gpa: Allocator,
     cwd: []const u8,
@@ -1728,36 +1779,66 @@ fn windowsResolveAgainstCwd(
     };
 }
 
-/// Returns the non-absolute path from `from` to `to` according to Windows rules.
+/// Returns the non-absolute path from `from` to `to` according to POSIX rules.
 ///
 /// Other than memory allocation, this is a pure function; the result solely
 /// depends on the input parameters.
 ///
 /// If `from` and `to` each resolve to the same path (after calling `resolve`
 /// on each), a zero-length string is returned.
-///
-pub fn relativePosix(allocator: Allocator, cwd: []const u8, from: []const u8, to: []const u8) Allocator.Error![]u8 {
-    const resolved_from = try resolveAllocPosix(allocator, &[_][]const u8{ cwd, from });
-    defer allocator.free(resolved_from);
-    const resolved_to = try resolveAllocPosix(allocator, &[_][]const u8{ cwd, to });
-    defer allocator.free(resolved_to);
+pub fn relativeAllocPosix(gpa: Allocator, cwd: []const u8, from: []const u8, to: []const u8) Allocator.Error![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try relativeAppendPosix(gpa, &buffer, cwd, from, to);
+    try buffer.shrinkToLen(gpa);
+    return buffer.toOwnedSliceAssert();
+}
 
-    var from_it = mem.tokenizeScalar(u8, resolved_from, '/');
-    var to_it = mem.tokenizeScalar(u8, resolved_to, '/');
+/// Appends the non-absolute path from `from` to `to` according to POSIX rules
+/// to the provided array list.
+///
+/// Other than modifying the provided array list, this is a pure function; the
+/// result solely depends on the input parameters and it does no file system
+/// operations.
+///
+/// If `from` and `to` each resolve to the same path (after calling
+/// `resolveAppend` on each), nothing is appended to the array list.
+pub fn relativeAppendPosix(
+    gpa: Allocator,
+    al: *std.ArrayList(u8),
+    cwd: []const u8,
+    from: []const u8,
+    to: []const u8,
+) Allocator.Error!void {
+    const orig_len = al.items.len;
+    errdefer al.items.len = orig_len;
+
+    const resolved_from_start = al.items.len;
+    try resolveAppendPosix(gpa, al, &.{ cwd, from });
+    const resolved_from_end = al.items.len;
+
+    const resolved_to_start = al.items.len;
+    try resolveAppendPosix(gpa, al, &.{ cwd, to });
+    const resolved_to_end = al.items.len;
+
+    var from_it = mem.tokenizeScalar(u8, al.items[resolved_from_start..resolved_from_end], '/');
+    var to_it = mem.tokenizeScalar(u8, al.items[resolved_to_start..resolved_to_end], '/');
     while (true) {
-        const from_component = from_it.next() orelse return allocator.dupe(u8, to_it.rest());
+        const from_component = from_it.next() orelse {
+            const result = to_it.rest();
+            @memmove(al.items[orig_len..][0..result.len], result);
+            al.shrinkRetainingCapacity(orig_len + result.len);
+            return;
+        };
         const to_rest = to_it.rest();
         if (to_it.next()) |to_component| {
             if (mem.eql(u8, from_component, to_component))
                 continue;
         }
         var up_count: usize = 1;
-        while (from_it.next()) |_| {
-            up_count += 1;
-        }
+        while (from_it.next()) |_| up_count += 1;
         const up_index_end = up_count * "../".len;
-        const result = try allocator.alloc(u8, up_index_end + to_rest.len);
-        errdefer allocator.free(result);
+        const result = al.items[orig_len..];
 
         var result_index: usize = 0;
         while (result_index < up_index_end) {
@@ -1765,15 +1846,16 @@ pub fn relativePosix(allocator: Allocator, cwd: []const u8, from: []const u8, to
             result_index += 3;
         }
         if (to_rest.len == 0) {
-            // shave off the trailing slash
-            return allocator.realloc(result, result_index - 1);
+            // Shave off the trailing slash.
+            al.shrinkRetainingCapacity(orig_len + result_index - 1);
+            return;
         }
-
-        @memcpy(result[result_index..][0..to_rest.len], to_rest);
-        return result;
+        @memmove(result[result_index..][0..to_rest.len], to_rest);
+        al.shrinkRetainingCapacity(orig_len + result_index + to_rest.len);
+        return;
     }
 
-    return [_]u8{};
+    al.shrinkRetainingCapacity(orig_len);
 }
 
 test relative {

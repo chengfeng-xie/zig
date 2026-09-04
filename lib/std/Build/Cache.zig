@@ -409,6 +409,7 @@ pub const Manifest = struct {
 
             pub fn getFallible(offset: Offset, contents: []u8) error{InvalidFormat}!*File {
                 if (@backingInt(offset) + @sizeOf(File) >= contents.len) return error.InvalidFormat;
+                if (!mem.isAligned(@backingInt(offset), @alignOf(File))) return error.InvalidFormat;
                 return get(offset, contents);
             }
         };
@@ -457,6 +458,14 @@ pub const Manifest = struct {
                 try setStat(file, m, stat);
                 return true;
             }
+        }
+
+        /// `path_len` does not include the null byte.
+        fn sizeOf(path_len: usize) usize {
+            const end = @offsetOf(File, "path_start") + path_len;
+            const needed_alignment = @alignOf(File) - (end % @alignOf(File));
+            assert(needed_alignment >= 1); // Always need at least a null byte.
+            return end + needed_alignment;
         }
     };
 
@@ -809,7 +818,7 @@ pub const Manifest = struct {
         };
         const contents = m.contents.items;
 
-        var off: u32 = 0;
+        var off: usize = 0;
         var c: Check = .{};
 
         // This group we always want to compute the hash digests, even on a
@@ -821,7 +830,7 @@ pub const Manifest = struct {
         // otherwise it's invalid format.
         for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len]) |*input_path, input_file_off| {
             if (off + 1 >= contents.len) return error.InvalidFormat;
-            const file_off: File.Offset = @fromBackingInt(off);
+            const file_off: File.Offset = @fromBackingInt(@intCast(off));
             const file = try file_off.getFallible(contents);
             if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
             const path = try filePathFallible(contents, file_off);
@@ -830,7 +839,7 @@ pub const Manifest = struct {
 
             input_group.async(io, checkInputFile, .{ m, &c, file_off, path, input_path });
 
-            off = @intCast(@as(usize, off) + @sizeOf(File) + path.len + 1);
+            off += File.sizeOf(path.len);
         }
 
         // Guess number of files based on manifest contents len to reduce allocations.
@@ -849,7 +858,7 @@ pub const Manifest = struct {
         defer post_select.cancelDiscard();
 
         while (off + 1 < contents.len) {
-            const file_off: File.Offset = @fromBackingInt(off);
+            const file_off: File.Offset = @fromBackingInt(@intCast(off));
             const file = try file_off.getFallible(contents);
             if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
             const path = try filePathFallible(contents, file_off);
@@ -860,7 +869,7 @@ pub const Manifest = struct {
             post_select.async(.checkFile, checkFile, .{ m, &c, file_off, path });
             post_select_remaining += 1;
 
-            off = @intCast(@as(usize, off) + @sizeOf(File) + path.len + 1);
+            off += File.sizeOf(path.len);
         }
 
         // Final terminating zero byte to distinguish empty manifest file from

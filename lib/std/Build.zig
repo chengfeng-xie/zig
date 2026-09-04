@@ -58,7 +58,8 @@ available_deps: AvailableDeps,
 
 pub const ConfigureDependency = struct {
     lazy_path: LazyPath,
-    mode: std.Build.Configuration.PathDep.Mode,
+    is_directory: bool,
+    metadata_only: bool,
 };
 
 pub const ReleaseMode = enum {
@@ -102,7 +103,8 @@ pub const Graph = struct {
     /// Populated by calling one of:
     /// * `dependOnFileContents`
     /// * `dependOnFileMetadata`
-    /// * `dependOnDirectory`
+    /// * `dependOnDirectoryContents`
+    /// * `dependOnDirectoryMetadata`
     configure_dependencies: ArrayList(ConfigureDependency) = .empty,
 
     /// If the cache is poisoned means that the **configure logic** had side
@@ -2602,7 +2604,8 @@ pub fn dependOnFileContents(b: *Build, lazy_path: LazyPath) void {
     const graph = b.graph;
     graph.configure_dependencies.append(graph.arena, .{
         .lazy_path = lazy_path.dupe(graph),
-        .mode = .contents,
+        .is_directory = false,
+        .metadata_only = false,
     }) catch @panic("OOM");
 }
 
@@ -2627,7 +2630,8 @@ pub fn dependOnFileMetadata(b: *Build, lazy_path: LazyPath) void {
     const graph = b.graph;
     graph.configure_dependencies.append(graph.arena, .{
         .lazy_path = lazy_path.dupe(graph),
-        .mode = .metadata,
+        .is_directory = false,
+        .metadata_only = true,
     }) catch @panic("OOM");
 }
 

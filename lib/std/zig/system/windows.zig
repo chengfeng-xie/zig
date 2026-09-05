@@ -203,6 +203,8 @@ fn genericCpuAndNativeFeatures(arch: Target.Cpu.Arch) Target.Cpu {
         .features = .empty,
     };
 
+    cpu.features.addFeatureSet(cpu.model.features);
+
     switch (arch) {
         .aarch64, .aarch64_be => {
             const Feature = Target.aarch64.Feature;
@@ -250,6 +252,8 @@ fn genericCpuAndNativeFeatures(arch: Target.Cpu.Arch) Target.Cpu {
         },
         else => {},
     }
+
+    cpu.features.populateDependencies(cpu.arch.allFeaturesList());
 
     return cpu;
 }

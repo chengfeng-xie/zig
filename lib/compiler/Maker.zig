@@ -199,12 +199,13 @@ pub fn main(init: process.Init.Minimal) !void {
         .random_seed = parseRandomSeed(seed_arg),
     };
 
-    const cmd = stringToEnum(enum { libc, init, fetch, build }, cmd_name) orelse
+    const cmd = stringToEnum(enum { libc, init, fetch, build, @"cache-cat" }, cmd_name) orelse
         fatal("bad command name: {q}", .{cmd_name});
     switch (cmd) {
         .libc => return cmdLibC(gpa, &graph, args[arg_i..]),
         .init => return cmdInit(gpa, &graph, args[arg_i..]),
         .fetch => return cmdFetch(gpa, &graph, args[arg_i..]),
+        .@"cache-cat" => return cmdCacheCat(gpa, &graph, args[arg_i..]),
         .build => {},
     }
 
@@ -1879,6 +1880,101 @@ fn cmdFetch(gpa: Allocator, graph: *Graph, args: []const []const u8) !void {
 
     return process.cleanExit(io);
 }
+
+fn cmdCacheCat(gpa: Allocator, graph: *Graph, args: []const []const u8) !void {
+    const io = graph.io;
+
+    var arg_i: usize = 0;
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(gpa);
+
+    while (nextArg(args, &arg_i)) |arg| {
+        if (mem.startsWith(u8, arg, "-")) {
+            if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
+                try Io.File.stdout().writeStreamingAll(io, usage_cache_cat);
+                return process.cleanExit(io);
+            } else {
+                fatal("unrecognized parameter: {q}", .{arg});
+            }
+        } else {
+            var file = Dir.cwd().openFile(io, arg, .{}) catch |err| fatal("opening {q} failed: {t}", .{ arg, err });
+            defer file.close(io);
+
+            var manifest_reader = file.reader(io, &.{}); // Reads positionally from zero.
+            contents.clearRetainingCapacity();
+            manifest_reader.interface.appendRemainingUnlimited(gpa, &contents) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.ReadFailed => switch (manifest_reader.err.?) {
+                    error.Canceled => |e| return e,
+                    else => |e| fatal("reading from {q} failed: {t}", .{ arg, e }),
+                },
+            };
+            const hex_digest = Dir.path.basename(arg);
+            cacheCatOne(hex_digest, contents.items, initStdoutWriter(io)) catch |err| switch (err) {
+                error.WriteFailed => fatal("writing to stdout failed: {t}", .{stdout_writer_allocation.err.?}),
+                else => |e| fatal("parsing {q} failed: {t}", .{ arg, e }),
+            };
+            try stdout_writer_allocation.flush();
+        }
+    }
+}
+
+fn cacheCatOne(input_hex_digest: []const u8, contents: []const u8, writer: *Io.Writer) !void {
+    var bin_digest: Cache.BinDigest = undefined;
+    _ = try fmt.hexToBytes(&bin_digest, input_hex_digest);
+
+    var hh: Cache.HashHelper = .{};
+    hh.hasher.update(&bin_digest);
+
+    var serializer: std.zon.Serializer = .{ .writer = writer };
+    var top_level = try serializer.beginStruct(.{});
+    try top_level.field("input_hash", input_hex_digest, .{});
+    var files_tuple = try top_level.beginTupleField("files", .{});
+    var off: usize = 0;
+    while (off + 1 < contents.len) {
+        const file_off: Cache.Manifest.File.Offset = @fromBackingInt(@intCast(off));
+        const file = try file_off.getFallibleConst(contents);
+        const path = try Cache.Manifest.filePathFallible(contents, file_off);
+        if (path.len == 0) return error.InvalidFormat;
+
+        var file_obj = try files_tuple.beginStructField(.{ .whitespace_style = .{ .wrap = false } });
+        try file_obj.field("size", file.size, .{});
+        try file_obj.field("inode", file.inode, .{});
+        try file_obj.field("mtime", file.mtime, .{});
+        const hex_digest = Cache.binToHex(file.digest);
+        try file_obj.field("digest", @as([]const u8, &hex_digest), .{});
+        if (file.flags.is_directory) try file_obj.field("directory", true, .{});
+        if (file.flags.metadata_only) try file_obj.field("metadata", true, .{});
+        try file_obj.field("prefix", file.flags.prefix, .{});
+        try file_obj.field("path", path, .{});
+        try file_obj.end();
+
+        hh.hasher.update(&file.digest);
+
+        off += Cache.Manifest.File.sizeOf(path.len);
+    }
+
+    try files_tuple.end();
+
+    var discovered_bin_digest: Cache.BinDigest = undefined;
+    hh.hasher.final(&discovered_bin_digest);
+    const discovered_hex_digest = Cache.binToHex(discovered_bin_digest);
+    try top_level.field("discovered_hash", @as([]const u8, &discovered_hex_digest), .{});
+
+    try top_level.end();
+    try writer.writeByte('\n');
+}
+
+const usage_cache_cat =
+    \\Usage: zig cache-cat <paths>
+    \\
+    \\   Prints .zig-cache/h/* manifest files in text form.
+    \\
+    \\Options:
+    \\  -h, --help             Print this help and exit
+    \\
+    \\
+;
 
 const usage_fetch =
     \\Usage: zig fetch [options] <url>

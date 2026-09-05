@@ -408,9 +408,14 @@ pub const Manifest = struct {
             }
 
             pub fn getFallible(offset: Offset, contents: []u8) error{InvalidFormat}!*File {
+                // TODO make @constCast support in-memory coercion across error unions and optionals
+                return @constCast(try getFallibleConst(offset, contents));
+            }
+
+            pub fn getFallibleConst(offset: Offset, contents: []const u8) error{InvalidFormat}!*const File {
                 if (@backingInt(offset) + @sizeOf(File) >= contents.len) return error.InvalidFormat;
                 if (!mem.isAligned(@backingInt(offset), @alignOf(File))) return error.InvalidFormat;
-                return get(offset, contents);
+                return getConst(offset, contents);
             }
         };
 
@@ -461,7 +466,7 @@ pub const Manifest = struct {
         }
 
         /// `path_len` does not include the null byte.
-        fn sizeOf(path_len: usize) usize {
+        pub fn sizeOf(path_len: usize) usize {
             const end = @offsetOf(File, "path_start") + path_len;
             const needed_alignment = @alignOf(File) - (end % @alignOf(File));
             assert(needed_alignment >= 1); // Always need at least a null byte.
@@ -1615,7 +1620,7 @@ pub const Manifest = struct {
         hasher.update(contents[hash_start..hash_end]);
     }
 
-    fn filePathFallible(contents: []const u8, off: File.Offset) error{InvalidFormat}![:0]const u8 {
+    pub fn filePathFallible(contents: []const u8, off: File.Offset) error{InvalidFormat}![:0]const u8 {
         const path_start = @backingInt(off) + @offsetOf(File, "path_start");
         const path_end = mem.findScalarPos(u8, contents, path_start, 0) orelse return error.InvalidFormat;
         return contents[path_start..path_end :0];

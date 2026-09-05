@@ -1565,10 +1565,10 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
 
     const configuration = c: {
         var file = configuration_path.root_dir.handle.openFile(io, configuration_path.sub_path, .{}) catch |err|
-            fatal("failed to open configuration file {f}: {t}", .{ configuration_path, err });
+            fatal("failed to open configuration file {qf}: {t}", .{ configuration_path, err });
         defer file.close(io);
         break :c Configuration.loadFile(arena, io, file) catch |err|
-            fatal("failed to load configuration file {f}: {t}", .{ configuration_path, err });
+            fatal("failed to load configuration file {qf}: {t}", .{ configuration_path, err });
     };
     // Technically if the configuration is marked as poisoned, we could
     // already delete the file now, but we leave it around in case the

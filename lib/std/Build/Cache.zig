@@ -866,15 +866,7 @@ pub const Manifest = struct {
             .contents = contents,
         });
 
-        // This group we would like to cancel as soon as a cache miss is discovered.
-        const PostResult = union(enum) {
-            checkFile: CheckFileError!Check.Status,
-        };
-        var post_select_buffer: [16]PostResult = undefined;
-        var post_select: Io.Select(PostResult) = .init(io, &post_select_buffer);
-        var post_select_remaining: usize = 0;
-        defer post_select.cancelDiscard();
-
+        // Validate and count discovered files.
         while (off + 1 < contents.len) {
             const file_off: File.Offset = @fromBackingInt(@intCast(off));
             const file = try file_off.getFallible(contents);
@@ -883,34 +875,6 @@ pub const Manifest = struct {
             if (path.len == 0) return error.InvalidFormat;
 
             try m.files.putContext(gpa, file_off, {}, .{ .contents = contents });
-
-            // In order to call async here we would need to ensure `post_select_buffer`
-            // has capacity for as many elements as files being checked. Since we don't want
-            // to dynamically allocate that buffer, we use concurrent + fallback here.
-            if (post_select.concurrent(.checkFile, checkFile, .{ m, &c, file_off, path })) |_| {
-                post_select_remaining += 1;
-            } else |err| switch (err) {
-                error.ConcurrencyUnavailable => {
-                    // Detect if input group already had a miss. In this case we still wait
-                    // for those digests to be updated, but cancel the non input group.
-                    switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
-                        .miss => {
-                            post_select.cancelDiscard();
-                            try input_group.await(io);
-                            return .miss;
-                        },
-                        .hit => {},
-                    }
-                    switch (try checkFile(m, &c, file_off, path)) {
-                        .hit => continue,
-                        .miss => {
-                            post_select.cancelDiscard();
-                            try input_group.await(io);
-                            return .miss;
-                        },
-                    }
-                },
-            }
 
             off += File.sizeOf(path.len);
         }
@@ -925,6 +889,36 @@ pub const Manifest = struct {
 
         // Don't track the trailing zero byte in contents.
         m.contents.items.len -= 1;
+        // Needed due to the length mutation above.
+        const refreshed_contents = m.contents.items;
+
+        // This group we would like to cancel as soon as a cache miss is discovered.
+        const PostResult = union(enum) {
+            checkFile: CheckFileError!Check.Status,
+        };
+        // In order to call async in the loop we need to ensure this buffer has capacity for as many elements as files
+        // being checked, otherwise a deadlock could occur since writing to the queue is waiting on the same task as
+        // would read from it.
+        const post_select_buffer = try gpa.alloc(PostResult, m.files.count() - m.input_paths.items.len);
+        defer gpa.free(post_select_buffer);
+
+        var post_select: Io.Select(PostResult) = .init(io, post_select_buffer);
+        defer post_select.cancelDiscard();
+
+        var post_select_remaining: usize = 0;
+        for (m.files.keys()[m.input_paths.items.len..]) |file_off| {
+            post_select.async(.checkFile, checkFile, .{ m, &c, file_off, filePath(refreshed_contents, file_off) });
+            post_select_remaining += 1;
+            // In case the async checkFile runs eagerly.
+            switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
+                .miss => {
+                    post_select.cancelDiscard();
+                    try input_group.await(io);
+                    return .miss;
+                },
+                .hit => {},
+            }
+        }
 
         var post_await_buffer: [16]PostResult = undefined;
         while (post_select_remaining > 0) {
@@ -957,9 +951,6 @@ pub const Manifest = struct {
         try input_group.await(io);
         if (c.status == .miss) return .miss;
         if (m.diagnostic != .none) return error.CacheCheckFailed;
-
-        // Needed due to the length mutation above.
-        const refreshed_contents = m.contents.items;
 
         for (m.files.keys()) |file_off| {
             m.hash.hasher.update(&file_off.get(refreshed_contents).digest);

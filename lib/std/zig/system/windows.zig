@@ -3,11 +3,10 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const mem = std.mem;
 const Target = std.Target;
-
-pub const WindowsVersion = std.Target.Os.WindowsVersion;
-pub const PF = std.os.windows.PF;
-pub const REG = std.os.windows.REG;
-pub const IsProcessorFeaturePresent = std.os.windows.IsProcessorFeaturePresent;
+const WindowsVersion = std.Target.Os.WindowsVersion;
+const PF = std.os.windows.PF;
+const REG = std.os.windows.REG;
+const IsProcessorFeaturePresent = std.os.windows.IsProcessorFeaturePresent;
 
 /// Returns the highest known WindowsVersion deduced from reported runtime information.
 /// Discards information about in-between versions we don't differentiate.

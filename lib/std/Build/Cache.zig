@@ -365,6 +365,8 @@ pub const Manifest = struct {
         inode: u64,
         /// Nanoseconds.
         mtime: i64,
+        /// To simplify the hashing logic, this value is computed from size, inode, and mtime
+        /// in `hashFromMetadata` in the case that `Flags.metadata_only` is `true`.
         digest: BinDigest,
         /// Starting with this field and continuing into the path, excluding the null byte,
         /// is the string that is hashed for the manifest digest.
@@ -439,6 +441,14 @@ pub const Manifest = struct {
                 return mem.eql(u8, a_path, b_path);
             }
         };
+
+        fn hashFromMetadata(file: *File) void {
+            var hasher = hasher_init;
+            hasher.update(mem.asBytes(&file.size));
+            hasher.update(mem.asBytes(&file.inode));
+            hasher.update(mem.asBytes(&file.mtime));
+            hasher.final(&file.digest);
+        }
 
         fn setStat(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!void {
             file.size = stat.size;
@@ -660,16 +670,19 @@ pub const Manifest = struct {
     pub fn checkProgressless(man: *Manifest) Check.Error!Check.Status {
         assert(man.manifest_file == null);
 
+        // This is *not* hashing the contents of the input files. It is the
+        // flags (including prefix) and path only.
         for (man.files.keys()[0..man.input_paths.items.len]) |file_off| {
-            man.digestHash(file_off, &man.hash.hasher);
+            man.hashFlagsAndPath(file_off, &man.hash.hasher);
         }
 
         man.diagnostic = .none;
 
-        var bin_digest: BinDigest = undefined;
-        man.hash.hasher.final(&bin_digest);
-        const hex_digest = binToHex(bin_digest);
-        const manifest_file_path = &hex_digest;
+        var input_digest: BinDigest = undefined;
+        man.hash.hasher.final(&input_digest);
+        const input_hex_digest = binToHex(input_digest);
+
+        const manifest_file_path = &input_hex_digest;
         const io = man.cache.io;
 
         // We'll try to open the cache with an exclusive lock, but if that would block
@@ -744,22 +757,20 @@ pub const Manifest = struct {
 
         man.want_refresh_timestamp = true;
 
-        // We're going to construct a second hash. Its input will begin with the digest we've
-        // already computed (`bin_digest`), and then it'll have the digests of each input file,
-        // including "post" files (see `addDiscoveredPath`). If this is a hit, we learn the set of "post"
-        // files from the manifest on disk. If this is a miss, we'll learn those from future calls
-        // to `addDiscoveredPath` etc. As such, the state of `man.hash.hasher` after this function
-        // depends on whether this is a hit or a miss.
+        // We're going to construct a second hash. Its input will begin with the digest we've already computed
+        // (`input_digest`), and then it'll have the digests of each input file, including discovered files (see
+        // `addDiscoveredPath`). If this is a hit, we learn the set of discovered files from the manifest on disk. If
+        // this is a miss, we'll learn those from future calls to `addDiscoveredPath` etc. As such, the state of
+        // `man.hash.hasher` after this function depends on whether this is a hit or a miss.
         //
-        // If we return `CacheStatus.hit`, then `man.hash.hasher` must already include
-        // the digests of the "post" files, so the caller can call `final`. Otherwise, on a cache
-        // miss, `man.hash.hasher` will include the digests of all non-"post" files -- that is,
-        // the ones we've already been told about. The rest will be discovered through calls to
-        // `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user can
-        // use `final`, and will at some point `writeManifest` the file list to disk.
+        // If we return `CacheStatus.hit`, then `man.hash.hasher` must already include the digests of the discovered
+        // files, so the caller can call `final`. Otherwise, on a cache miss, `man.hash.hasher` will include the digests
+        // of all non-discovered files -- that is, the ones we've already been told about. The rest will be discovered
+        // through calls to `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user
+        // can use `final`, and will at some point `writeManifest` the file list to disk.
 
         man.hash.hasher = hasher_init;
-        man.hash.hasher.update(&bin_digest);
+        man.hash.hasher.update(&input_digest);
 
         hit: {
             digests: {
@@ -772,7 +783,7 @@ pub const Manifest = struct {
                 // Before trying again, we must reset `man.hash.hasher` and `man.files`.
                 // This is basically just the first half of `unhit`.
                 man.hash.hasher = hasher_init;
-                man.hash.hasher.update(&bin_digest);
+                man.hash.hasher.update(&input_digest);
                 man.shrinkFilesToInput();
                 switch (try man.checkLocked()) {
                     .hit => break :hit,
@@ -784,7 +795,7 @@ pub const Manifest = struct {
             // unless it returns an error.
             man.manifest_dirty = true;
             // All input file digests are already populated by `checkLocked`, so we can call `unhit` directly.
-            unhit(man, &bin_digest);
+            unhit(man, &input_digest);
             return .miss;
         }
 
@@ -1005,9 +1016,9 @@ pub const Manifest = struct {
             const actual_is_directory = actual_stat.kind == .directory;
             if (actual_is_directory != file.flags.is_directory) return .miss;
 
-            if (try file.setStatChanged(m, .init(actual_stat))) return .miss;
-
-            return .hit;
+            const changed = try file.setStatChanged(m, .init(actual_stat));
+            file.hashFromMetadata();
+            return if (changed) .miss else .hit;
         }
 
         if (file.flags.is_directory) {
@@ -1082,15 +1093,15 @@ pub const Manifest = struct {
         return .hit;
     }
 
-    /// Reset `man.hash.hasher` to the state it should be in after `hit` returns `Check.Status.miss`.
+    /// Reset `man.hash.hasher` to the state it should be in after `check` returns `Check.Status.miss`.
     /// The hasher contains the original input digest, and all original input file digests (i.e.
-    /// not including post files).
+    /// not including discovered files).
     ///
-    /// Assumes that `bin_digest` is populated for all input files.
-    pub fn unhit(man: *Manifest, bin_digest: *const BinDigest) void {
+    /// Assumes that `digest` is populated for all input files.
+    pub fn unhit(man: *Manifest, input_digest: *const BinDigest) void {
         // Reset the hash.
         man.hash.hasher = hasher_init;
-        man.hash.hasher.update(bin_digest);
+        man.hash.hasher.update(input_digest);
         man.shrinkFilesToInput();
         const contents = man.contents.items;
         for (man.files.keys()) |off| {
@@ -1206,13 +1217,14 @@ pub const Manifest = struct {
         if (options.stat) |stat| {
             try header.setStat(m, stat);
             if (header.flags.metadata_only) {
-                return;
+                header.hashFromMetadata();
             } else if (options.contents) |contents| {
                 var hasher = hasher_init;
                 hasher.update(contents);
                 hasher.final(&header.digest);
-                return;
             }
+            m.hash.hasher.update(&header.digest);
+            return;
         }
 
         const need_stat = options.stat == null;
@@ -1243,6 +1255,8 @@ pub const Manifest = struct {
                 try populateFile(m, header, need_stat, handle, options.contents, metadata_only);
             },
         }
+
+        m.hash.hasher.update(&header.digest);
     }
 
     fn populateFile(
@@ -1259,7 +1273,10 @@ pub const Manifest = struct {
             const stat = try handle.stat(io);
             try file.setStat(m, .init(stat));
         }
-        if (metadata_only) return;
+        if (metadata_only) {
+            file.hashFromMetadata();
+            return;
+        }
         if (contents) |bytes| {
             var hasher = hasher_init;
             hasher.update(bytes);
@@ -1285,7 +1302,10 @@ pub const Manifest = struct {
             const stat = try handle.stat(io);
             try file.setStat(m, .init(stat));
         }
-        if (metadata_only) return;
+        if (metadata_only) {
+            file.hashFromMetadata();
+            return;
+        }
         if (contents) |bytes| {
             var hasher = hasher_init;
             hasher.update(bytes);
@@ -1611,7 +1631,7 @@ pub const Manifest = struct {
         hasher.final(bin_digest);
     }
 
-    fn digestHash(m: *const Manifest, off: File.Offset, hasher: *Hasher) void {
+    fn hashFlagsAndPath(m: *const Manifest, off: File.Offset, hasher: *Hasher) void {
         const contents = m.contents.items;
         const flags_off = @offsetOf(File, "flags");
         comptime assert(@offsetOf(File, "path_start") - flags_off == 1);

@@ -107,6 +107,7 @@ const normal_usage =
     \\
     \\  env              Print lib path, std path, cache directory, and version
     \\  help             Print this help and exit
+    \\  cache-cat        Print a zig-cache manifest file as zon
     \\  std              View standard library documentation in a browser
     \\  libc             Display native libc paths file or validate one
     \\  targets          List available compilation targets
@@ -242,6 +243,10 @@ const Cmd = enum {
     ar,
 
     build,
+    @"cache-cat",
+    fetch,
+    init,
+    libc,
 
     clang,
     @"-cc1",
@@ -258,10 +263,7 @@ const Cmd = enum {
     fmt,
     objcopy,
     objdump,
-    fetch,
-    libc,
     std,
-    init,
     targets,
     version,
     env,
@@ -351,7 +353,7 @@ fn mainArgs(
             dev.check(.ar_command);
             return process.exit(try llvmArMain(arena, args));
         },
-        .build, .fetch, .init, .libc => {
+        .build, .fetch, .init, .libc, .@"cache-cat" => {
             return jitCmd(gpa, arena, io, cmd_args, environ_map, .{
                 .cmd_name = "maker",
                 .root_src_path = "Maker.zig",

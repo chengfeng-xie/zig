@@ -1330,8 +1330,16 @@ pub const IOV_MAX = switch (native_os) {
 };
 pub const CTL = switch (native_os) {
     .freebsd => struct {
+        pub const SYSCTL = 0;
         pub const KERN = 1;
+        pub const VM = 2;
+        pub const VFS = 3;
+        pub const NET = 4;
         pub const DEBUG = 5;
+        pub const HW = 6;
+        pub const MACHDEP = 7;
+        pub const USER = 8;
+        pub const P1003_1B = 9;
     },
     .netbsd => struct {
         pub const KERN = 1;

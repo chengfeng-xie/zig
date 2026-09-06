@@ -132,11 +132,32 @@ const powerpc = struct {
     }
 };
 
+const riscv = struct {
+    const models = .{
+        .{ "SiFive U5", &std.Target.riscv.cpu.sifive_u54 },
+        .{ "SiFive U7", &std.Target.riscv.cpu.sifive_u74 },
+        .{ "SpacemiT X60", &std.Target.riscv.cpu.spacemit_x60 },
+        .{ "SpacemiT X100", &std.Target.riscv.cpu.spacemit_x100 },
+    };
+
+    fn detectNativeCpu(arch: std.Target.Cpu.Arch) ?std.Target.Cpu {
+        var buf: [64:0]u8 = undefined;
+        const name = hwModelName(&buf) orelse return null;
+
+        inline for (models) |pair| {
+            if (std.mem.startsWith(u8, name, pair[0])) return pair[1].toCpu(arch);
+        }
+
+        return null;
+    }
+};
+
 pub fn detectNativeCpuAndFeatures() ?std.Target.Cpu {
     return switch (native_arch) {
         .aarch64 => aarch64.detectNativeCpuAndFeatures(native_arch),
         .arm => arm.detectNativeCpu(native_arch),
         .powerpc, .powerpc64 => powerpc.detectNativeCpu(native_arch),
+        .riscv64 => riscv.detectNativeCpu(native_arch),
         else => null,
     };
 }

@@ -3,6 +3,24 @@ const std = @import("std");
 
 const native_arch = builtin.target.cpu.arch;
 
+fn hwModelName(buf: [:0]u8) ?[:0]const u8 {
+    const mib: [2]c_int = [_]c_int{
+        std.c.CTL.HW,
+        std.c.HW.MODEL,
+    };
+    var len: usize = buf.len + 1;
+
+    std.posix.sysctl(&mib, buf.ptr, &len, null, 0) catch |err| switch (err) {
+        error.NameTooLong => unreachable,
+        error.PermissionDenied => unreachable,
+        error.SystemResources => unreachable,
+        error.UnknownName => unreachable,
+        error.Unexpected => return null,
+    };
+
+    return buf[0 .. len - 1 :0];
+}
+
 const aarch64 = struct {
     inline fn mrs(comptime feat_reg: []const u8) u64 {
         return asm ("mrs %[ret], " ++ feat_reg
@@ -27,6 +45,35 @@ const aarch64 = struct {
         };
 
         return @import("arm.zig").aarch64.detectNativeCpuAndFeatures(arch, registers);
+    }
+};
+
+const arm = struct {
+    const models = .{
+        .{ "ARM ARM1176", &std.Target.arm.cpu.arm1176jzf_s },
+        .{ "ARM Cortex-A12", &std.Target.arm.cpu.cortex_a12 },
+        .{ "ARM Cortex-A15", &std.Target.arm.cpu.cortex_a15 },
+        .{ "ARM Cortex-A17", &std.Target.arm.cpu.cortex_a17 },
+        .{ "ARM Cortex-A53", &std.Target.arm.cpu.cortex_a53 },
+        .{ "ARM Cortex-A57", &std.Target.arm.cpu.cortex_a57 },
+        .{ "ARM Cortex-A5", &std.Target.arm.cpu.cortex_a5 },
+        .{ "ARM Cortex-A72", &std.Target.arm.cpu.cortex_a72 },
+        .{ "ARM Cortex-A73", &std.Target.arm.cpu.cortex_a73 },
+        .{ "ARM Cortex-A7", &std.Target.arm.cpu.cortex_a7 },
+        .{ "ARM Cortex-A8", &std.Target.arm.cpu.cortex_a8 },
+        .{ "ARM Cortex-A9", &std.Target.arm.cpu.cortex_a9 },
+        .{ "Qualcomm Krait 300", &std.Target.arm.cpu.krait },
+    };
+
+    fn detectNativeCpu(arch: std.Target.Cpu.Arch) ?std.Target.Cpu {
+        var buf: [64:0]u8 = undefined;
+        const name = hwModelName(&buf) orelse return null;
+
+        inline for (models) |pair| {
+            if (std.mem.startsWith(u8, name, pair[0])) return pair[1].toCpu(arch);
+        }
+
+        return null;
     }
 };
 
@@ -78,22 +125,8 @@ const powerpc = struct {
     };
 
     fn detectNativeCpu(arch: std.Target.Cpu.Arch) ?std.Target.Cpu {
-        const mib: [2]c_int = [_]c_int{
-            std.c.CTL.HW,
-            std.c.HW.MODEL,
-        };
         var buf: [64:0]u8 = undefined;
-        var len: usize = buf.len + 1;
-
-        std.posix.sysctl(&mib, &buf, &len, null, 0) catch |err| switch (err) {
-            error.NameTooLong => unreachable,
-            error.PermissionDenied => unreachable,
-            error.SystemResources => unreachable,
-            error.UnknownName => unreachable,
-            error.Unexpected => return null,
-        };
-
-        const name = buf[0 .. len - 1 :0];
+        const name = hwModelName(&buf) orelse return null;
 
         inline for (models) |pair| {
             if (std.mem.eql(u8, name, pair[0])) return pair[1].toCpu(arch);
@@ -106,6 +139,7 @@ const powerpc = struct {
 pub fn detectNativeCpuAndFeatures() ?std.Target.Cpu {
     return switch (native_arch) {
         .aarch64 => aarch64.detectNativeCpuAndFeatures(native_arch),
+        .arm => arm.detectNativeCpu(native_arch),
         .powerpc64, .powerpc64le => powerpc.detectNativeCpu(native_arch),
         else => null,
     };

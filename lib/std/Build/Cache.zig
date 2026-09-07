@@ -839,13 +839,10 @@ pub const Manifest = struct {
         var off: usize = 0;
         var c: Check = .{};
 
-        // This group we always want to compute the hash digests, even on a
-        // cache miss, because they will be used in the manifest digest.
-        var input_group: Io.Group = .init;
-        defer input_group.cancel(io);
+        // We always want to compute the input file hash digests, even on a cache miss, because they will be
+        // used in the manifest digest.
 
-        // First the input files section, which must match our input files,
-        // otherwise it's invalid format.
+        // First the input files section, which must match our input files, otherwise it's invalid format.
         for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len]) |*input_path, input_file_off| {
             if (off + 1 >= contents.len) return error.InvalidFormat;
             const file_off: File.Offset = @fromBackingInt(@intCast(off));
@@ -855,10 +852,13 @@ pub const Manifest = struct {
             if (path.len == 0) return error.InvalidFormat;
             if (input_file_off != file_off) return error.InvalidFormat;
 
-            input_group.async(io, checkInputFile, .{ m, &c, file_off, path, input_path });
+            try checkInputFile(m, &c, file_off, path, input_path);
 
             off += File.sizeOf(path.len);
         }
+
+        if (c.status == .miss) return .miss;
+        if (m.diagnostic != .none) return error.CacheCheckFailed;
 
         // Guess number of files based on manifest contents len to reduce allocations.
         // This is not an upper bound; subsequent insertions may potentially allocate.
@@ -875,6 +875,10 @@ pub const Manifest = struct {
             if (path.len == 0) return error.InvalidFormat;
 
             try m.files.putContext(gpa, file_off, {}, .{ .contents = contents });
+            switch (try checkFile(m, &c, file_off, filePath(contents, file_off))) {
+                .hit => {},
+                .miss => return .miss,
+            }
 
             off += File.sizeOf(path.len);
         }
@@ -882,79 +886,12 @@ pub const Manifest = struct {
         // Final terminating zero byte to distinguish empty manifest file from
         // manifest with zero files.
         const file_valid = off + 1 == contents.len and contents[off] == 0;
-        if (!file_valid) {
-            try input_group.await(io);
-            return .miss;
-        }
+        if (!file_valid) return .miss;
+
+        for (m.files.keys()) |file_off| m.hash.hasher.update(&file_off.get(contents).digest);
 
         // Don't track the trailing zero byte in contents.
         m.contents.items.len -= 1;
-        // Needed due to the length mutation above.
-        const refreshed_contents = m.contents.items;
-
-        // This group we would like to cancel as soon as a cache miss is discovered.
-        const PostResult = union(enum) {
-            checkFile: CheckFileError!Check.Status,
-        };
-        // In order to call async in the loop we need to ensure this buffer has capacity for as many elements as files
-        // being checked, otherwise a deadlock could occur since writing to the queue is waiting on the same task as
-        // would read from it.
-        const post_select_buffer = try gpa.alloc(PostResult, m.files.count() - m.input_paths.items.len);
-        defer gpa.free(post_select_buffer);
-
-        var post_select: Io.Select(PostResult) = .init(io, post_select_buffer);
-        defer post_select.cancelDiscard();
-
-        var post_select_remaining: usize = 0;
-        for (m.files.keys()[m.input_paths.items.len..]) |file_off| {
-            post_select.async(.checkFile, checkFile, .{ m, &c, file_off, filePath(refreshed_contents, file_off) });
-            post_select_remaining += 1;
-            // In case the async checkFile runs eagerly.
-            switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
-                .miss => {
-                    post_select.cancelDiscard();
-                    try input_group.await(io);
-                    return .miss;
-                },
-                .hit => {},
-            }
-        }
-
-        var post_await_buffer: [16]PostResult = undefined;
-        while (post_select_remaining > 0) {
-            const n = try post_select.awaitMany(&post_await_buffer, 1);
-            post_select_remaining -= n;
-
-            // Detect if input group already had a miss. In this case we still wait
-            // for those digests to be updated, but cancel the non input group.
-            switch (@atomicLoad(Check.Status, &c.status, .unordered)) {
-                .miss => {
-                    post_select.cancelDiscard();
-                    try input_group.await(io);
-                    return .miss;
-                },
-                .hit => {},
-            }
-
-            for (post_await_buffer[0..n]) |u| switch (u) {
-                .checkFile => |result| switch (try result) {
-                    .hit => continue,
-                    .miss => {
-                        post_select.cancelDiscard();
-                        try input_group.await(io);
-                        return .miss;
-                    },
-                },
-            };
-        }
-
-        try input_group.await(io);
-        if (c.status == .miss) return .miss;
-        if (m.diagnostic != .none) return error.CacheCheckFailed;
-
-        for (m.files.keys()) |file_off| {
-            m.hash.hasher.update(&file_off.get(refreshed_contents).digest);
-        }
 
         return .hit;
     }
@@ -965,17 +902,14 @@ pub const Manifest = struct {
         file_off: File.Offset,
         file_path: [:0]const u8,
         input_path: *InputPath,
-    ) Io.Cancelable!void {
+    ) CheckFileError!void {
         if (input_path.have_handle) @panic("TODO");
         if (input_path.have_stat) @panic("TODO");
         if (input_path.contents != .not_requested) @panic("TODO");
         if (input_path.request_handle) @panic("TODO");
-        if (checkFile(m, c, file_off, file_path)) |status| switch (status) {
-            .hit => return,
-            .miss => @atomicStore(Check.Status, &c.status, .miss, .unordered),
-        } else |err| switch (err) {
-            error.CacheCheckFailed => assert(m.diagnostic != .none),
-            else => |e| return e,
+        switch (try checkFile(m, c, file_off, file_path)) {
+            .hit => {},
+            .miss => c.status = .miss,
         }
     }
 

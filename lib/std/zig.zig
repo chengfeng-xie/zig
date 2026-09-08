@@ -1839,7 +1839,7 @@ pub fn buildExeSubprocess(
                     const prefix: Server.Message.PathPrefix = @fromBackingInt(@intCast(prefixed_path[0] - 1));
                     const sub_path = prefixed_path[1..];
                     man.addDiscoveredPath(.{
-                        .path = .{ .prefixed = .{
+                        .discovered_path = .{ .prefixed = .{
                             .prefix = @intCast(@backingInt(prefix)),
                             .sub_path = sub_path,
                         } },

@@ -701,39 +701,12 @@ pub const Path = struct {
         };
     }
 
-    pub fn addToCacheManifestPostHit(p: Path, man: *Cache.Manifest, dirs: *const std.zig.Directories) !void {
-        comptime assert(0 == @backingInt(std.zig.Server.Message.PathPrefix.cwd));
-        comptime assert(1 == @backingInt(std.zig.Server.Message.PathPrefix.zig_lib));
-        comptime assert(2 == @backingInt(std.zig.Server.Message.PathPrefix.local_cache));
-        comptime assert(3 == @backingInt(std.zig.Server.Message.PathPrefix.global_cache));
-        comptime assert(4 == @backingInt(std.zig.Server.Message.PathPrefix.build_root));
-        comptime assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".field_names.len == 5);
-        const gpa = man.cache.gpa;
-        const prefixed_path: Cache.PrefixedPath = .{
-            .prefix = switch (p.root) {
-                .none => {
-                    const path = try p.toAbsolute(dirs, gpa);
-                    defer gpa.free(path);
-                    return man.addFilePost(path);
-                },
-                .zig_lib => 1,
-                .local_cache => 2,
-                .global_cache => 3,
-                .build_root => 4,
-            },
-            .sub_path = try gpa.dupe(u8, p.sub_path),
-        };
-        var keep = false;
-        defer if (!keep) gpa.free(prefixed_path.sub_path);
-        keep = try man.addPrefixedPathPost(prefixed_path);
-    }
-
-    pub fn addToCacheManifestPostHitContents(
+    pub fn addToCacheManifestAsDiscovered(
         p: Path,
         man: *Cache.Manifest,
         dirs: *const std.zig.Directories,
-        bytes: []const u8,
-        stat: Cache.File.Stat,
+        contents: ?[]const u8,
+        stat: ?Cache.Manifest.Stat,
     ) !void {
         comptime assert(0 == @backingInt(std.zig.Server.Message.PathPrefix.cwd));
         comptime assert(1 == @backingInt(std.zig.Server.Message.PathPrefix.zig_lib));
@@ -741,24 +714,29 @@ pub const Path = struct {
         comptime assert(3 == @backingInt(std.zig.Server.Message.PathPrefix.global_cache));
         comptime assert(4 == @backingInt(std.zig.Server.Message.PathPrefix.build_root));
         comptime assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".field_names.len == 5);
-        const gpa = man.cache.gpa;
-        const prefixed_path: Cache.PrefixedPath = .{
-            .prefix = switch (p.root) {
-                .none => {
-                    const path = try p.toAbsolute(dirs, gpa);
-                    defer gpa.free(path);
-                    return man.addFilePostContents(path, bytes, stat);
+        try man.addDiscoveredPath(.{
+            .discovered_path = .{ .prefixed = .{
+                .prefix = switch (p.root) {
+                    .none => {
+                        const gpa = man.cache.gpa;
+                        const path = try p.toAbsolute(dirs, gpa);
+                        defer gpa.free(path);
+                        return man.addDiscoveredPath(.{
+                            .discovered_path = .{ .unresolved = .initCwd(path) },
+                            .contents = contents,
+                            .stat = stat,
+                        });
+                    },
+                    .zig_lib => 1,
+                    .local_cache => 2,
+                    .global_cache => 3,
+                    .build_root => 4,
                 },
-                .zig_lib => 1,
-                .local_cache => 2,
-                .global_cache => 3,
-                .build_root => 4,
-            },
-            .sub_path = try gpa.dupe(u8, p.sub_path),
-        };
-        var keep = false;
-        defer if (!keep) gpa.free(prefixed_path.sub_path);
-        keep = try man.addPrefixedPathPostContents(prefixed_path, bytes, stat);
+                .sub_path = p.sub_path,
+            } },
+            .contents = contents,
+            .stat = stat,
+        });
     }
 };
 
@@ -2830,20 +2808,18 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                 man.want_shared_lock = false;
             }
 
-            const is_hit = man.check(main_progress_node) catch |err| switch (err) {
+            const status = man.check(main_progress_node) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
                 error.CacheCheckFailed => switch (man.diagnostic) {
                     .none => unreachable,
-                    .manifest_create, .manifest_read, .manifest_lock => |e| return comp.setMiscFailure(
+                    .manifest_create, .manifest_stat, .manifest_read, .manifest_lock => |e| return comp.setMiscFailure(
                         .check_whole_cache,
                         "failed to check cache: {t} {t}",
                         .{ man.diagnostic, e },
                     ),
                     .file_open, .file_stat, .file_read, .file_hash => |op| {
-                        const pp = man.files.keys()[op.file_index].prefixed_path;
-                        const prefix = man.cache.prefixes()[pp.prefix];
-                        return comp.setMiscFailure(.check_whole_cache, "failed to check cache: {f}{s} {t} {t}", .{
-                            prefix, pp.sub_path, man.diagnostic, op.err,
+                        return comp.setMiscFailure(.check_whole_cache, "failed to check cache: {f} {t} {t}", .{
+                            op.path(&man), man.diagnostic, op.err,
                         });
                     },
                 },
@@ -2853,7 +2829,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                     .{},
                 ),
             };
-            if (is_hit and !ignore_hit) {
+            if (status == .hit and !ignore_hit) {
                 // In this case the cache hit contains the full set of file system inputs. Nice!
                 if (comp.file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
                 if (comp.parent_whole_cache) |pwc| {
@@ -3438,8 +3414,8 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
 
     const opts = comp.cache_use.whole.lf_open_opts;
 
-    try man.addOptionalFilePath(opts.linker_script);
-    try man.addOptionalFilePath(opts.version_script);
+    try man.addInputPathOptional(opts.linker_script, .{});
+    try man.addInputPathOptional(opts.version_script, .{});
     man.hash.add(opts.allow_undefined_version);
     man.hash.addOptional(opts.enable_new_dtags);
 
@@ -3498,7 +3474,7 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
 
     // Mach-O specific stuff
     try link.File.MachO.hashAddFrameworks(man, opts.frameworks);
-    try man.addOptionalFilePath(opts.entitlements);
+    try man.addInputPathOptional(opts.entitlements, .{});
     man.hash.addOptional(opts.pagezero_size);
     man.hash.addOptional(opts.headerpad_size);
     man.hash.add(opts.headerpad_max_install_names);
@@ -5889,7 +5865,7 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
         const rc_basename = try std.fmt.allocPrint(arena, "{s}.rc", .{src_basename});
         const res_basename = try std.fmt.allocPrint(arena, "{s}.res", .{src_basename});
 
-        const digest = if (try man.check(child_progress_node)) man.final() else blk: {
+        const digest = if (.hit == try man.check(child_progress_node)) man.final() else blk: {
             // The digest only depends on the .manifest file, so we can
             // get the digest now and write the .res directly to the cache
             const digest = man.final();
@@ -5982,7 +5958,7 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
 
     const rc_basename_noext = src_basename[0 .. src_basename.len - fs.path.extension(src_basename).len];
 
-    const digest = if (try man.check(child_progress_node)) man.final() else blk: {
+    const digest = if (.hit == try man.check(child_progress_node)) man.final() else blk: {
         var zig_cache_tmp_dir = try comp.dirs.local_cache.handle.createDirPathOpen(io, "tmp", .{});
         defer zig_cache_tmp_dir.close(io);
 
@@ -6039,12 +6015,14 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
                     return comp.failWin32Resource(win32_resource, "depfile from zig rc has unexpected format", .{});
                 }
                 const dep_file_path = element.string;
-                try man.addFilePost(dep_file_path);
+                try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(dep_file_path) } });
                 switch (comp.cache_use) {
                     .whole => |whole| if (whole.cache_manifest) |whole_cache_manifest| {
                         try whole.cache_manifest_mutex.lock(io);
                         defer whole.cache_manifest_mutex.unlock(io);
-                        try whole_cache_manifest.addFilePost(dep_file_path);
+                        try whole_cache_manifest.addDiscoveredPath(.{
+                            .discovered_path = .{ .unresolved = .initCwd(dep_file_path) },
+                        });
                     },
                     .incremental, .none => {},
                 }

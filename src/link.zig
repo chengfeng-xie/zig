@@ -1925,15 +1925,21 @@ pub fn hashInputs(man: *Cache.Manifest, link_inputs: []const Input) !void {
         man.hash.add(@as(@typeInfo(Input).@"union".tag_type.?, link_input));
         switch (link_input) {
             .object, .archive => |obj| {
-                _ = try man.addOpenedFile(obj.path, obj.file, null);
+                _ = try man.addInputPath(obj.path, .{
+                    .handle = .{ .file = obj.file },
+                });
                 man.hash.add(obj.must_link);
                 man.hash.add(obj.hidden);
             },
             .res => |res| {
-                _ = try man.addOpenedFile(res.path, res.file, null);
+                _ = try man.addInputPath(res.path, .{
+                    .handle = .{ .file = res.file },
+                });
             },
             .dso => |dso| {
-                _ = try man.addOpenedFile(dso.path, dso.file, null);
+                _ = try man.addInputPath(dso.path, .{
+                    .handle = .{ .file = dso.file },
+                });
                 man.hash.add(dso.needed);
                 man.hash.add(dso.weak);
                 man.hash.add(dso.reexport);

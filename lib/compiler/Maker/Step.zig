@@ -753,7 +753,7 @@ fn failWithCacheError(
     switch (err) {
         error.CacheCheckFailed => switch (man.diagnostic) {
             .none => unreachable,
-            .manifest_create, .manifest_read, .manifest_lock => |e| {
+            .manifest_create, .manifest_stat, .manifest_read, .manifest_lock => |e| {
                 return s.fail(maker, "failed checking cache: {t} {t}", .{ man.diagnostic, e });
             },
             .file_open, .file_stat, .file_read, .file_hash => |op| {

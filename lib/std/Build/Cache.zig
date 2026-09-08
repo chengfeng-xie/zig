@@ -1104,25 +1104,45 @@ pub const Manifest = struct {
         return timestamp.nanoseconds >= man.recent_problematic_timestamp.nanoseconds;
     }
 
-    pub const AddPathPostOptions = struct {
-        path: union(enum) {
-            unresolved: Path,
-            prefixed: PrefixedPath,
-        },
+    pub const AddDiscoveredPathOptions = struct {
+        discovered_path: DiscoveredPath,
         handle: PathHandle = .{ .file = null },
         stat: ?Stat = null,
         /// If it is a directory, there is a special encoding required for contents, which
         /// is null-separated sorted entries, each one prefixed with `File.Kind`.
         contents: ?[]const u8 = null,
         metadata_only: bool = false,
+        /// Populated if and only if `error.FileSystemFailure` is returned from `addDiscoveredPath`.
+        diagnostic: ?*AddDiscoveredPathDiagnostic = null,
     };
+
+    pub const DiscoveredPath = union(enum) {
+        unresolved: Path,
+        prefixed: PrefixedPath,
+    };
+
+    pub const AddDiscoveredPathDiagnostic = union(enum) {
+        none,
+        open_file: Io.File.OpenError,
+        open_dir: Io.Dir.OpenError,
+        stat_file: Io.File.StatError,
+        stat_dir: Io.Dir.StatError,
+        read_file: Io.File.ReadPositionalError,
+        read_dir: Io.Dir.Reader.Error,
+    };
+
+    pub const AddDiscoveredPathError = error{
+        /// If this is returned, diagnostic will be populated.
+        /// If contents and stat are both provided, this is unreachable.
+        FileSystemFailure,
+    } || Allocator.Error || Io.Cancelable;
 
     /// Add a file as a dependency of process being cached, after cache miss
     /// occurs.
     ///
     /// See also:
     /// * `addInputPath`
-    pub fn addDiscoveredPath(m: *Manifest, options: AddPathPostOptions) !void {
+    pub fn addDiscoveredPath(m: *Manifest, options: AddDiscoveredPathOptions) AddDiscoveredPathError!void {
         assert(m.manifest_file != null);
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -1135,7 +1155,7 @@ pub const Manifest = struct {
         try m.contents.appendNTimes(gpa, 0, @offsetOf(File, "path_start"));
         errdefer m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
 
-        const new_prefix = switch (options.path) {
+        const new_prefix = switch (options.discovered_path) {
             .unresolved => |unresolved| try cache.resolveAppendPath(&m.contents, unresolved),
             .prefixed => |prefixed| try cache.appendPrefixedPath(&m.contents, prefixed),
         };
@@ -1184,26 +1204,38 @@ pub const Manifest = struct {
 
         switch (options.handle) {
             .dir => |opt_handle| if (opt_handle) |handle| {
-                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only);
+                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
                 const sub_path = filePath(m.contents.items, file_offset);
-                const handle = try dir.openDir(io, sub_path, .{
+                const handle = dir.openDir(io, sub_path, .{
                     .access_sub_paths = false,
                     .iterate = true,
-                });
+                }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| {
+                        if (options.diagnostic) |d| d.* = .{ .open_dir = e };
+                        return error.FileSystemFailure;
+                    },
+                };
                 defer handle.close(io);
-                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only);
+                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             },
 
             .file => |opt_handle| if (opt_handle) |handle| {
-                try populateFile(m, header, need_stat, handle, options.contents, metadata_only);
+                try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
                 const sub_path = filePath(m.contents.items, file_offset);
-                const handle = try dir.openFile(io, sub_path, .{ .mode = .read_only });
+                const handle = dir.openFile(io, sub_path, .{ .mode = .read_only }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| {
+                        if (options.diagnostic) |d| d.* = .{ .open_file = e };
+                        return error.FileSystemFailure;
+                    },
+                };
                 defer handle.close(io);
-                try populateFile(m, header, need_stat, handle, options.contents, metadata_only);
+                try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             },
         }
 
@@ -1217,11 +1249,18 @@ pub const Manifest = struct {
         handle: Io.File,
         contents: ?[]const u8,
         metadata_only: bool,
-    ) !void {
+        diagnostic: ?*AddDiscoveredPathDiagnostic,
+    ) AddDiscoveredPathError!void {
         const io = m.cache.io;
 
         if (need_stat) {
-            const stat = try handle.stat(io);
+            const stat = handle.stat(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .stat_file = e };
+                    return error.FileSystemFailure;
+                },
+            };
             try file.setStat(m, .init(stat));
         }
         if (metadata_only) {
@@ -1233,7 +1272,13 @@ pub const Manifest = struct {
             hasher.update(bytes);
             hasher.final(&file.digest);
         } else {
-            try hashFile(io, handle, &file.digest);
+            hashFile(io, handle, &file.digest) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .read_file = e };
+                    return error.FileSystemFailure;
+                },
+            };
         }
     }
 
@@ -1244,13 +1289,20 @@ pub const Manifest = struct {
         handle: Io.Dir,
         contents: ?[]const u8,
         metadata_only: bool,
-    ) !void {
+        diagnostic: ?*AddDiscoveredPathDiagnostic,
+    ) AddDiscoveredPathError!void {
         const cache = m.cache;
         const io = cache.io;
         const gpa = cache.gpa;
 
         if (need_stat) {
-            const stat = try handle.stat(io);
+            const stat = handle.stat(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .stat_dir = e };
+                    return error.FileSystemFailure;
+                },
+            };
             try file.setStat(m, .init(stat));
         }
         if (metadata_only) {
@@ -1264,7 +1316,13 @@ pub const Manifest = struct {
         } else {
             const prev_contents_len = m.all_input_content.items.len;
             defer m.all_input_content.shrinkRetainingCapacity(prev_contents_len);
-            try hashDir(gpa, io, handle, &file.digest, &m.all_input_content);
+            hashDir(gpa, io, handle, &file.digest, &m.all_input_content) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .read_dir = e };
+                    return error.FileSystemFailure;
+                },
+            };
         }
     }
 
@@ -1297,13 +1355,15 @@ pub const Manifest = struct {
             .target, .target_must_resolve => {},
             .prereq => |file_path| if (self.manifest_file == null) {
                 _ = try self.addInputPath(.initCwd(file_path), .{});
-            } else try self.addDiscoveredPath(.{ .path = .{ .unresolved = .initCwd(file_path) } }),
+            } else try self.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(file_path) } }),
             .prereq_must_resolve => {
                 resolve_buf.clearRetainingCapacity();
                 try token.resolve(gpa, &resolve_buf);
                 if (self.manifest_file == null) {
                     _ = try self.addInputPath(.initCwd(resolve_buf.items), .{});
-                } else try self.addDiscoveredPath(.{ .path = .{ .unresolved = .initCwd(resolve_buf.items) } });
+                } else try self.addDiscoveredPath(.{
+                    .discovered_path = .{ .unresolved = .initCwd(resolve_buf.items) },
+                });
             },
             else => |err| {
                 try err.printError(gpa, &error_buf);
@@ -1456,10 +1516,12 @@ pub const Manifest = struct {
         const gpa = man.cache.gpa;
         const files = man.files.keys();
         if (files.len > 0) {
+            const contents = man.contents.items;
             for (files) |file| {
-                try buf.ensureUnusedCapacity(gpa, file.prefixed_path.sub_path.len + 2);
-                buf.appendAssumeCapacity(file.prefixed_path.prefix + 1);
-                buf.appendSliceAssumeCapacity(file.prefixed_path.sub_path);
+                const file_path = filePath(contents, file);
+                try buf.ensureUnusedCapacity(gpa, file_path.len + 2);
+                buf.appendAssumeCapacity(@as(u8, file.get(contents).flags.prefix) + 1);
+                buf.appendSliceAssumeCapacity(file_path);
                 buf.appendAssumeCapacity(0);
             }
             // The null byte is a separator, not a terminator.
@@ -1476,12 +1538,12 @@ pub const Manifest = struct {
         const orig_files_len = other.files.count();
         const orig_contents_len = other.contents.items.len;
         errdefer {
-            other.files.shrinkRetainingCapacity(orig_files_len);
+            other.files.shrinkRetainingCapacityContext(orig_files_len, .{ .contents = other.contents.items });
             other.contents.shrinkRetainingCapacity(orig_contents_len);
         }
 
         for (man.files.keys(), 0..) |off, file_index| {
-            try other.files.ensureUnusedCapacity(gpa, 1);
+            try other.files.ensureUnusedCapacityContext(gpa, 1, .{ .contents = other.contents.items });
 
             const next_off = if (file_index < man.files.count())
                 @backingInt(man.files.keys()[file_index + 1])
@@ -1489,20 +1551,21 @@ pub const Manifest = struct {
                 man.contents.items.len;
 
             const copy_bytes = man.contents.items[@backingInt(off)..next_off];
-            const prev_contents_len = other.contents.items.len;
+            const prev_contents_len: File.Offset = @fromBackingInt(@intCast(other.contents.items.len));
             try other.contents.appendSlice(gpa, copy_bytes);
 
-            const gop = other.files.getOrPutAssumeCapacityContext(@fromBackingInt(prev_contents_len), .{
-                .manifest = other,
+            const gop = other.files.getOrPutAssumeCapacityContext(prev_contents_len, .{
+                .contents = other.contents.items,
             });
 
             if (gop.found_existing) {
-                other.contents.shrinkRetainingCapacity(prev_contents_len);
+                other.contents.shrinkRetainingCapacity(@backingInt(prev_contents_len));
                 continue;
             }
 
-            const other_file = File.get(@fromBackingInt(prev_contents_len));
-            other_file.prefix = prefix_map[other_file.prefix];
+            // Flags are already copied but the prefix is supposed to be filtered by `prefix_map`.
+            const other_file = prev_contents_len.get(other.contents.items);
+            other_file.flags.prefix = @intCast(prefix_map[other_file.flags.prefix]);
         }
     }
 

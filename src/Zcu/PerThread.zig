@@ -224,11 +224,12 @@ pub fn update(
                 const result = res: {
                     try whole.cache_manifest_mutex.lock(io);
                     defer whole.cache_manifest_mutex.unlock(io);
-                    if (file.source) |source| {
-                        break :res file.path.addToCacheManifestPostHitContents(man, &comp.dirs, source, file.stat);
-                    } else {
-                        break :res file.path.addToCacheManifestPostHit(man, &comp.dirs);
-                    }
+                    break :res file.path.addToCacheManifestAsDiscovered(
+                        man,
+                        &comp.dirs,
+                        file.source,
+                        if (file.source != null) file.stat else null,
+                    );
                 };
                 result catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
@@ -2835,26 +2836,21 @@ fn updateBuiltinModule(pt: Zcu.PerThread, opts: Builtin) Allocator.Error!struct 
         assert(mem.eql(u8, import_path, "std")); // the single import is of 'std'
     }
 
-    Builtin.updateFileOnDisk(file, comp) catch |err| comp.setMiscFailure(
-        .write_builtin_zig,
-        "unable to write '{f}': {s}",
-        .{ file.path.fmt(comp), @errorName(err) },
-    );
+    Builtin.updateFileOnDisk(file, comp) catch |err|
+        comp.setMiscFailure(.write_builtin_zig, "unable to write {qf}: {t}", .{ file.path.fmt(comp), err });
     return .{
         .file = file_index,
         .module_root = mod,
     };
 }
 
+pub const EmbedFileError = error{ImportOutsideModulePath} || Allocator.Error || Io.Cancelable;
+
 pub fn embedFile(
     pt: Zcu.PerThread,
     cur_file: *Zcu.File,
     import_string: []const u8,
-) error{
-    OutOfMemory,
-    Canceled,
-    ImportOutsideModulePath,
-}!Zcu.EmbedFile.Index {
+) EmbedFileError!Zcu.EmbedFile.Index {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
@@ -2937,7 +2933,7 @@ fn updateEmbedFileInner(
     };
     defer file.close(io);
 
-    const stat: Cache.File.Stat = .fromFs(try file.stat(io));
+    const stat: Cache.Manifest.Stat = .init(try file.stat(io));
 
     if (ef.val != .none) {
         const old_stat = ef.stat;
@@ -2994,10 +2990,7 @@ fn updateEmbedFileInner(
 }
 
 /// Assumes that `path` is allocated into `gpa`. Takes ownership of `path` on success.
-fn newEmbedFile(
-    pt: Zcu.PerThread,
-    path: Compilation.Path,
-) !*Zcu.EmbedFile {
+fn newEmbedFile(pt: Zcu.PerThread, path: Compilation.Path) EmbedFileError!*Zcu.EmbedFile {
     const zcu = pt.zcu;
     const comp = zcu.comp;
     const io = comp.io;
@@ -3034,7 +3027,10 @@ fn newEmbedFile(
         try whole.cache_manifest_mutex.lock(io);
         defer whole.cache_manifest_mutex.unlock(io);
 
-        try path.addToCacheManifestPostHitContents(man, &comp.dirs, contents, new_file.stat);
+        path.addToCacheManifestAsDiscovered(man, &comp.dirs, contents, new_file.stat) catch |err| switch (err) {
+            error.FileSystemFailure => unreachable, // contents and stat are both provided
+            else => |e| return e,
+        };
     }
 
     return new_file;

@@ -251,18 +251,16 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8, prog_node: std.P
     const final_lib_basename = try std.fmt.allocPrint(gpa, "{s}.lib", .{lib_name});
     errdefer gpa.free(final_lib_basename);
 
-    const is_hit = man.check(prog_node) catch |err| switch (err) {
+    const status = man.check(prog_node) catch |err| switch (err) {
         error.CacheCheckFailed => switch (man.diagnostic) {
             .none => unreachable,
-            .manifest_create, .manifest_read, .manifest_lock => |e| {
+            .manifest_create, .manifest_stat, .manifest_read, .manifest_lock => |e| {
                 comp.setMiscFailure(.windows_import_lib, "checking cache failed: {t} {t}", .{ man.diagnostic, e });
                 return error.AlreadyReported;
             },
             .file_open, .file_stat, .file_read, .file_hash => |op| {
-                const pp = man.files.keys()[op.file_index].prefixed_path;
-                const prefix = man.cache.prefixes()[pp.prefix];
-                comp.setMiscFailure(.windows_import_lib, "checking cache failed: {f}{s} {t} {t}", .{
-                    prefix, pp.sub_path, man.diagnostic, op.err,
+                comp.setMiscFailure(.windows_import_lib, "checking cache failed: {f} {t} {t}", .{
+                    op.path(&man), man.diagnostic, op.err,
                 });
                 return error.AlreadyReported;
             },
@@ -273,7 +271,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8, prog_node: std.P
             return error.AlreadyReported;
         },
     };
-    if (is_hit) {
+    if (status == .hit) {
         const digest = man.final();
         const sub_path = try std.fs.path.join(gpa, &.{ "o", &digest, final_lib_basename });
         errdefer gpa.free(sub_path);

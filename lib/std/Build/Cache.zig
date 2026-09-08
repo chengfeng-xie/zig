@@ -67,7 +67,8 @@ fn appendPrefixedPath(cache: *const Cache, contents: *std.ArrayList(u8), prefixe
     const end = contents.items.len + prefixed_path.sub_path.len;
     const needed_alignment = @alignOf(Manifest.File) - (end % @alignOf(Manifest.File));
     assert(needed_alignment >= 1); // Always need at least a null byte.
-    try contents.ensureTotalCapacity(cache.gpa, end + needed_alignment);
+    // Extra +1 here is due to the requirement to keep at least 1 unused capacity in `Manifest.contents` at all times.
+    try contents.ensureTotalCapacity(cache.gpa, end + needed_alignment + 1);
     contents.appendSliceAssumeCapacity(prefixed_path.sub_path);
     contents.appendNTimesAssumeCapacity(0, needed_alignment);
     return prefixed_path.prefix;
@@ -97,7 +98,10 @@ fn resolveAppendPath(cache: *const Cache, contents: *std.ArrayList(u8), path: Pa
 
         const needed_alignment = @alignOf(Manifest.File) - (contents.items.len % @alignOf(Manifest.File));
         assert(needed_alignment >= 1); // Always need at least a null byte.
-        try contents.appendNTimes(gpa, 0, needed_alignment);
+        // Extra +1 here is due to the requirement to keep at least 1 unused capacity in `Manifest.contents` at all
+        // times.
+        try contents.ensureUnusedCapacity(gpa, needed_alignment + 1);
+        contents.appendNTimesAssumeCapacity(0, needed_alignment);
 
         return @intCast(i);
     }
@@ -107,7 +111,9 @@ fn resolveAppendPath(cache: *const Cache, contents: *std.ArrayList(u8), path: Pa
 
     const needed_alignment = @alignOf(Manifest.File) - (contents.items.len % @alignOf(Manifest.File));
     assert(needed_alignment >= 1); // Always need at least a null byte.
-    try contents.appendNTimes(gpa, 0, needed_alignment);
+    // Extra +1 here is due to the requirement to keep at least 1 unused capacity in `Manifest.contents` at all times.
+    try contents.ensureUnusedCapacity(gpa, needed_alignment + 1);
+    contents.appendNTimesAssumeCapacity(0, needed_alignment);
 
     return 0;
 }
@@ -127,10 +133,10 @@ pub const Hasher = crypto.auth.siphash.SipHash128(1, 3);
 /// Refresh this with new random bytes when the manifest
 /// format is modified in a non-backwards-compatible way.
 pub const hasher_init: Hasher = Hasher.init(&.{
-    0x33, 0x52, 0xa2, 0x84,
-    0xcf, 0x17, 0x56, 0x57,
-    0x01, 0xbb, 0xcd, 0xe4,
-    0x77, 0xd6, 0xf0, 0x60,
+    0x02, 0xe9, 0xfa, 0xfe,
+    0xe0, 0x95, 0x81, 0x55,
+    0xf5, 0x5a, 0x15, 0xcb,
+    0x4a, 0xf4, 0x00, 0x09,
 });
 
 pub const HashHelper = struct {
@@ -487,7 +493,8 @@ pub const Manifest = struct {
     pub const Diagnostic = union(enum) {
         none,
         manifest_create: Io.File.OpenError,
-        manifest_read: Io.File.Reader.Error,
+        manifest_stat: Io.File.StatError,
+        manifest_read: Io.File.ReadPositionalError,
         manifest_lock: Io.File.LockError,
         file_open: FileOp,
         file_stat: FileOp,
@@ -644,7 +651,7 @@ pub const Manifest = struct {
         return @fromBackingInt(@intCast(gop.index));
     }
 
-    pub fn addInputFileOptional(m: *Manifest, opt_path: ?Path, options: AddInputPathOptions) Allocator.Error!void {
+    pub fn addInputPathOptional(m: *Manifest, opt_path: ?Path, options: AddInputPathOptions) Allocator.Error!void {
         m.hash.add(opt_path != null);
         _ = try addInputPath(m, opt_path orelse return, options);
     }
@@ -824,23 +831,42 @@ pub const Manifest = struct {
     fn checkLocked(m: *Manifest) Check.Error!Check.Status {
         const gpa = m.cache.gpa;
         const io = m.cache.io;
+        const manifest_file = m.manifest_file.?;
 
-        var manifest_reader = m.manifest_file.?.reader(io, &.{}); // Reads positionally from zero.
-        m.contents.clearRetainingCapacity();
-        manifest_reader.interface.appendRemainingUnlimited(gpa, &m.contents) catch |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            error.ReadFailed => {
-                m.diagnostic = .{ .manifest_read = manifest_reader.err.? };
+        const manifest_size = if (manifest_file.stat(io)) |stat| stat.size else |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => |e| {
+                m.diagnostic = .{ .manifest_stat = e };
                 return error.CacheCheckFailed;
             },
         };
+
+        // We always want to compute the input file hash digests, even on a cache miss, because they will be
+        // used in the manifest digest.
+
+        if (manifest_size == 0 or manifest_size < m.contents.items.len) {
+            // Don't clobber our input files by overwriting contents since it's a cache miss.
+            try m.contents.ensureUnusedCapacity(gpa, 1);
+            return .miss;
+        }
+
+        // Already supposedly includes the extra null byte that we have to maintain.
+        try m.contents.resize(gpa, manifest_size);
+
+        {
+            const n = manifest_file.readPositionalAll(io, m.contents.items, 0) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    m.diagnostic = .{ .manifest_read = e };
+                    return error.CacheCheckFailed;
+                },
+            };
+            m.contents.shrinkRetainingCapacity(n);
+        }
         const contents = m.contents.items;
 
         var off: usize = 0;
         var c: Check = .{};
-
-        // We always want to compute the input file hash digests, even on a cache miss, because they will be
-        // used in the manifest digest.
 
         // First the input files section, which must match our input files, otherwise it's invalid format.
         for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len]) |*input_path, input_file_off| {
@@ -1466,7 +1492,7 @@ pub const Manifest = struct {
             const prev_contents_len = other.contents.items.len;
             try other.contents.appendSlice(gpa, copy_bytes);
 
-            const gop = other.files.getOrPutAssumeCapacity(@fromBackingInt(prev_contents_len), .{
+            const gop = other.files.getOrPutAssumeCapacityContext(@fromBackingInt(prev_contents_len), .{
                 .manifest = other,
             });
 
@@ -1514,7 +1540,7 @@ pub const Manifest = struct {
         var entries_list: std.ArrayList(u32) = .empty;
         defer entries_list.deinit(gpa);
 
-        while (true) {
+        while (reader.state != .finished) {
             const entries = entry_buffer[0..try reader.read(io, &entry_buffer)];
             for (try entries_list.addManyAsSlice(gpa, entries.len), entries) |*off, entry| {
                 off.* = @intCast(contents.items.len);
@@ -1528,12 +1554,15 @@ pub const Manifest = struct {
         }
 
         const Sort = struct {
-            contents: []const u8,
+            contents: [*:0]const u8,
             pub fn lessThan(this: @This(), lhs: u32, rhs: u32) bool {
-                return mem.lessThanZ(u8, this.contents[lhs + 1 ..], this.contents[rhs + 1 ..]); // +1 for kind byte
+                // This comparison includes the kind byte.
+                return mem.lessThanZ(u8, this.contents + lhs, this.contents + rhs);
             }
         };
-        mem.sortUnstable(u32, entries_list.items, @as(Sort, .{ .contents = contents.items }), Sort.lessThan);
+        mem.sortUnstable(u32, entries_list.items, @as(Sort, .{
+            .contents = @ptrCast(contents.items.ptr),
+        }), Sort.lessThan);
 
         // Duplicate the contents such that we may refer to it while creating a
         // sorted copy in the original position (at contents_start). We will then
@@ -1546,7 +1575,7 @@ pub const Manifest = struct {
             const offset = wrong_offset + contents_len;
             // Includes the kind prefix which we also want to copy.
             const entry: [*:0]const u8 = @ptrCast(contents.items[offset..]);
-            new_offset += mem.copySentinel(u8, 0, contents.items[new_offset..], entry);
+            new_offset += mem.copySentinelInclusive(u8, 0, contents.items[new_offset..], entry);
         }
         assert(new_offset == contents_start + contents_len);
         contents.shrinkRetainingCapacity(contents_start + contents_len);

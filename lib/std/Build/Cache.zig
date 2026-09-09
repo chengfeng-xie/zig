@@ -1531,6 +1531,8 @@ pub const Manifest = struct {
         }
         m.files.deinit(gpa);
         m.contents.deinit(gpa);
+        m.input_paths.deinit(gpa);
+        m.all_input_content.deinit(gpa);
         m.* = undefined;
     }
 

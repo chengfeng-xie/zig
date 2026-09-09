@@ -275,10 +275,9 @@ pub const Manifest = struct {
     /// When this is null, `Manifest` is in "pre-check" phase. Otherwise it is in "post-check" phase.
     manifest_file: ?Io.File,
     manifest_dirty: bool,
-    /// Set this flag to true before calling hit() in order to indicate that
-    /// upon a cache hit, the code using the cache will not modify the files
-    /// within the cache directory. This allows multiple processes to utilize
-    /// the same cache directory at the same time.
+    /// Set this flag to true before calling `check` in order to indicate that upon a cache hit, the code
+    /// using the cache will not modify the files within the cache directory. This allows multiple processes
+    /// to utilize the same cache directory at the same time.
     want_shared_lock: bool = true,
     have_exclusive_lock: bool = false,
     // Indicate that we want isProblematicTimestamp to perform a filesystem write in
@@ -347,12 +346,23 @@ pub const Manifest = struct {
         have_stat: bool,
         /// Determines whether `File.digest` is populated.
         have_digest: bool,
-        contents: enum(usize) {
-            requested = std.math.maxInt(u32) - 1,
-            not_requested = std.math.maxInt(u32),
-            /// Byte offset index into `Manifest.all_input_content`.
-            _,
-        },
+        contents: packed union(u64) {
+            status: enum(u64) {
+                unrequested = std.math.maxInt(u64) - 1,
+                requested = std.math.maxInt(u64),
+                _,
+                pub fn populated(this: @This()) bool {
+                    return switch (this) {
+                        .unrequested, .requested => false,
+                        _ => true,
+                    };
+                }
+            },
+            populated: packed struct(u64) {
+                off: u32,
+                len: u32,
+            },
+        } align(@alignOf(u32)),
         /// `have_handle` determines whether this is populated.
         handle: union {
             file: Io.File,
@@ -362,6 +372,20 @@ pub const Manifest = struct {
         /// Index into `Manifest.input_paths`.
         pub const Index = enum(u32) {
             _,
+
+            pub fn get(i: @This(), manifest: *const Manifest) InputPath {
+                return manifest.input_paths.items[@backingInt(i)];
+            }
+
+            pub fn contents(i: @This(), manifest: *const Manifest) []const u8 {
+                const input_path = get(i, manifest);
+                const populated = switch (input_path.contents.status) {
+                    .unrequested => unreachable, // Must request contents before calling `check`.
+                    .requested => unreachable, // Must call `check` first.
+                    _ => input_path.contents.populated,
+                };
+                return manifest.all_input_content.items[populated.off..][0..populated.len];
+            }
         };
     };
 
@@ -611,8 +635,8 @@ pub const Manifest = struct {
                     existing_input_file.have_handle = true;
                 },
             }
-            if (options.request_contents) switch (existing_input_file.contents) {
-                .requested, .not_requested => existing_input_file.contents = .requested,
+            if (options.request_contents) switch (existing_input_file.contents.status) {
+                .requested, .unrequested => existing_input_file.contents = .{ .status = .requested },
                 _ => {},
             };
             const existing_header = m.files.keys()[gop.index].get(m.contents.items);
@@ -636,7 +660,7 @@ pub const Manifest = struct {
                     .file => |opt_file| if (opt_file) |file| .{ .file = file } else undefined,
                     .dir => |opt_dir| if (opt_dir) |dir| .{ .dir = dir } else undefined,
                 },
-                .contents = if (options.request_contents) .requested else .not_requested,
+                .contents = .{ .status = if (options.request_contents) .requested else .unrequested },
                 .have_digest = false,
                 .have_stat = options.stat != null,
             });
@@ -931,7 +955,7 @@ pub const Manifest = struct {
     ) CheckFileError!void {
         if (input_path.have_handle) @panic("TODO");
         if (input_path.have_stat) @panic("TODO");
-        if (input_path.contents != .not_requested) @panic("TODO");
+        if (input_path.contents.status != .unrequested) @panic("TODO");
         if (input_path.request_handle) @panic("TODO");
         switch (try checkFile(m, c, file_off, file_path)) {
             .hit => {},
@@ -1727,7 +1751,7 @@ test "cache file and then recall it" {
             _ = try ch.addInputPath(.initCwd(temp_file), .{});
 
             // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit(.none));
+            try testing.expectEqual(.miss, try ch.check(.none));
 
             digest1 = ch.final();
             try ch.writeManifest();
@@ -1742,7 +1766,7 @@ test "cache file and then recall it" {
             _ = try ch.addInputPath(.initCwd(temp_file), .{});
 
             // Cache hit! We just "built" the same file
-            try testing.expect(try ch.hit(.none));
+            try testing.expectEqual(.hit, try ch.check(.none));
             digest2 = ch.final();
 
             try testing.expectEqual(false, ch.have_exclusive_lock);
@@ -1788,40 +1812,40 @@ test "check that changing a file makes cache fail" {
         defer cache.manifest_dir.close(io);
 
         {
-            var ch = cache.obtain();
-            defer ch.deinit();
+            var man = cache.obtain();
+            defer man.deinit();
 
-            ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
+            man.hash.addBytes("1234");
+            const temp_file_idx = try man.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
 
             // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit(.none));
+            try testing.expectEqual(.miss, try man.check(.none));
 
-            try testing.expect(mem.eql(u8, original_temp_file_contents, ch.files.keys()[temp_file_idx].contents.?));
+            try testing.expectEqualStrings(original_temp_file_contents, temp_file_idx.contents(&man));
 
-            digest1 = ch.final();
+            digest1 = man.final();
 
-            try ch.writeManifest();
+            try man.writeManifest();
         }
 
         try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = updated_temp_file_contents });
 
         {
-            var ch = cache.obtain();
-            defer ch.deinit();
+            var man = cache.obtain();
+            defer man.deinit();
 
-            ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
+            man.hash.addBytes("1234");
+            const temp_file_idx = try man.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
 
             // A file that we depend on has been updated, so the cache should not contain an entry for it
-            try testing.expectEqual(false, try ch.hit(.none));
+            try testing.expectEqual(.miss, try man.check(.none));
 
             // The cache system does not keep the contents of re-hashed input files.
-            try testing.expect(ch.files.keys()[temp_file_idx].contents == null);
+            try testing.expectEqual(false, temp_file_idx.get(&man).contents.status.populated());
 
-            digest2 = ch.final();
+            digest2 = man.final();
 
-            try ch.writeManifest();
+            try man.writeManifest();
         }
 
         try testing.expect(!mem.eql(u8, digest1[0..], digest2[0..]));
@@ -1858,7 +1882,7 @@ test "no file inputs" {
         man.hash.addBytes("1234");
 
         // There should be nothing in the cache
-        try testing.expectEqual(false, try man.check(.none));
+        try testing.expectEqual(.miss, try man.check(.none));
 
         digest1 = man.final();
 
@@ -1870,7 +1894,7 @@ test "no file inputs" {
 
         man.hash.addBytes("1234");
 
-        try testing.expect(try man.check(.none));
+        try testing.expectEqual(.hit, try man.check(.none));
         digest2 = man.final();
         try testing.expectEqual(false, man.have_exclusive_lock);
     }
@@ -1922,9 +1946,9 @@ test "Manifest with files added after initial hash work" {
             _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
             // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit(.none));
+            try testing.expectEqual(.miss, try ch.check(.none));
 
-            _ = try ch.addDiscoveredPath(temp_file2);
+            _ = try ch.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(temp_file2) } });
 
             digest1 = ch.final();
             try ch.writeManifest();
@@ -1936,7 +1960,7 @@ test "Manifest with files added after initial hash work" {
             ch.hash.addBytes("1234");
             _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
-            try testing.expect(try ch.hit(.none));
+            try testing.expect(.hit == try ch.check(.none));
             digest2 = ch.final();
 
             try testing.expectEqual(false, ch.have_exclusive_lock);
@@ -1960,9 +1984,9 @@ test "Manifest with files added after initial hash work" {
             _ = try ch.addInputPath(.initCwd(temp_file1), .{});
 
             // A file that we depend on has been updated, so the cache should not contain an entry for it
-            try testing.expectEqual(false, try ch.hit(.none));
+            try testing.expectEqual(.miss, try ch.check(.none));
 
-            _ = try ch.addDiscoveredPath(temp_file2);
+            _ = try ch.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(temp_file2) } });
 
             digest3 = ch.final();
 

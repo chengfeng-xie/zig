@@ -48,7 +48,7 @@ pub fn obtain(cache: *Cache) Manifest {
         .cache = cache,
         .hash = cache.hash,
         .manifest_file = null,
-        .manifest_dirty = false,
+        .dirty = false,
     };
 }
 
@@ -274,7 +274,8 @@ pub const Manifest = struct {
     hash: HashHelper,
     /// When this is null, `Manifest` is in "pre-check" phase. Otherwise it is in "post-check" phase.
     manifest_file: ?Io.File,
-    manifest_dirty: bool,
+    /// `finalize` has not been called yet.
+    dirty: bool,
     /// Set this flag to true before calling `check` in order to indicate that upon a cache hit, the code
     /// using the cache will not modify the files within the cache directory. This allows multiple processes
     /// to utilize the same cache directory at the same time.
@@ -306,30 +307,6 @@ pub const Manifest = struct {
     all_input_content: std.ArrayList(u8) = .empty,
     max_input_content_len: usize = std.math.maxInt(u32),
 
-    /// State that exists only during check.
-    pub const Check = struct {
-        /// Protects `Manifest.diagnostic` from data races.
-        diagnostic_lock: bool = false,
-        status: Status = .hit,
-
-        pub const Status = enum { hit, miss };
-
-        pub const Error = error{
-            /// Unable to check the cache for a reason that has been recorded into
-            /// the `diagnostic` field.
-            CacheCheckFailed,
-            /// A cache manifest file exists however it could not be parsed.
-            InvalidFormat,
-        } || Allocator.Error || Io.Cancelable;
-
-        fn fail(c: *Check, m: *Manifest, diagnostic: Diagnostic) error{CacheCheckFailed} {
-            if (!@atomicRmw(bool, &c.diagnostic_lock, .Xchg, true, .monotonic)) {
-                m.diagnostic = diagnostic;
-            }
-            return error.CacheCheckFailed;
-        }
-    };
-
     pub const Files = std.array_hash_map.Custom(File.Offset, void, File.HashContext, false);
 
     /// Source files and directories whose prefix and relative path are
@@ -340,7 +317,9 @@ pub const Manifest = struct {
     /// but the other fields of `File` will be populated depending on the
     /// fields of `InputPath`.
     pub const InputPath = struct {
+        /// Determines whether `check` will keep the handle open or close it.
         request_handle: bool,
+        /// Determines whether `handle` is populated.
         have_handle: bool,
         /// Determines whether `File.size`, `File.inode`, and `File.mtime` are populated.
         have_stat: bool,
@@ -362,12 +341,25 @@ pub const Manifest = struct {
                 off: u32,
                 len: u32,
             },
+
+            pub fn get(this: @This(), all_contents: []const u8) ?[]const u8 {
+                return if (this.status.populated())
+                    all_contents[this.status.populated.off..][0..this.status.populated.len]
+                else
+                    null;
+            }
         } align(@alignOf(u32)),
         /// `have_handle` determines whether this is populated.
         handle: union {
             file: Io.File,
             dir: Io.Dir,
         },
+
+        pub const Handle = union(enum) {
+            none,
+            file: Io.File,
+            dir: Io.Dir,
+        };
 
         /// Index into `Manifest.input_paths`.
         pub const Index = enum(u32) {
@@ -387,6 +379,13 @@ pub const Manifest = struct {
                 return manifest.all_input_content.items[populated.off..][0..populated.len];
             }
         };
+
+        pub fn getHandle(this: @This(), file: *const File) Handle {
+            return if (!this.have_handle) .none else switch (file.flags.is_directory) {
+                false => .{ .file = this.handle.file },
+                true => .{ .dir = this.handle.dir },
+            };
+        }
     };
 
     /// The data per tracked input file that is stored in the manifest file.
@@ -449,6 +448,24 @@ pub const Manifest = struct {
                 if (!mem.isAligned(@backingInt(offset), @alignOf(File))) return error.InvalidFormat;
                 return getConst(offset, contents);
             }
+
+            pub fn flagsAndPath(off: File.Offset, contents: []const u8) [:0]const u8 {
+                const flags_off = @offsetOf(File, "flags");
+                comptime assert(@offsetOf(File, "path_start") - flags_off == 1);
+                const hash_start = @backingInt(off) + flags_off;
+                const hash_end = mem.findScalarPos(u8, contents, hash_start, 0).?;
+                return contents[hash_start..hash_end];
+            }
+
+            pub fn pathFallible(off: File.Offset, contents: []const u8) error{InvalidFormat}![:0]const u8 {
+                const path_start = @backingInt(off) + @offsetOf(File, "path_start");
+                const path_end = mem.findScalarPos(u8, contents, path_start, 0) orelse return error.InvalidFormat;
+                return contents[path_start..path_end :0];
+            }
+
+            pub fn path(off: File.Offset, contents: []const u8) [:0]const u8 {
+                return pathFallible(contents, off) catch unreachable;
+            }
         };
 
         /// Intentionally matches if the files are different only by flags other than prefix.
@@ -457,7 +474,7 @@ pub const Manifest = struct {
 
             pub fn hash(this: @This(), off: Offset) u32 {
                 const file_prefix = off.getConst(this.contents).flags.prefix;
-                const file_path = filePath(this.contents, off);
+                const file_path = off.path(this.contents);
                 return @truncate(std.hash.Wyhash.hash(file_prefix, file_path));
             }
 
@@ -466,8 +483,8 @@ pub const Manifest = struct {
                 const a_prefix = a_off.getConst(this.contents).flags.prefix;
                 const b_prefix = b_off.getConst(this.contents).flags.prefix;
                 if (a_prefix != b_prefix) return false;
-                const a_path = filePath(this.contents, a_off);
-                const b_path = filePath(this.contents, b_off);
+                const a_path = a_off.path(this.contents);
+                const b_path = b_off.path(this.contents);
                 return mem.eql(u8, a_path, b_path);
             }
         };
@@ -480,12 +497,24 @@ pub const Manifest = struct {
             hasher.final(&file.digest);
         }
 
-        fn setStat(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!void {
-            file.size = stat.size;
-            file.inode = stat.inode;
-            file.mtime = @intCast(stat.mtime.toNanoseconds());
+        fn stat(file: *const File) Stat {
+            return .{
+                .size = file.size,
+                .inode = file.inode,
+                .mtime = file.mtime,
+            };
+        }
 
-            if (try m.isProblematicTimestamp(stat.mtime)) {
+        fn setStatUnchecked(file: *File, s: Stat) void {
+            file.size = s.size;
+            file.inode = s.inode;
+            file.mtime = @intCast(s.mtime.toNanoseconds());
+        }
+
+        fn setStat(file: *File, m: *Manifest, s: Stat) Io.Cancelable!void {
+            setStatUnchecked(file, s);
+
+            if (try m.isProblematicTimestamp(s.mtime)) {
                 // The actual file has an unreliable timestamp; force it to be hashed.
                 file.mtime = 0;
                 file.inode = 0;
@@ -493,14 +522,14 @@ pub const Manifest = struct {
         }
 
         /// Returns true if the stat was changed. Updates the `file` with the new stat value.
-        fn setStatChanged(file: *File, m: *Manifest, stat: Stat) Io.Cancelable!bool {
-            if (stat.size == file.size and
-                stat.mtime.nanoseconds == file.mtime and
-                stat.inode == file.inode)
+        fn setStatChanged(file: *File, m: *Manifest, s: Stat) Io.Cancelable!bool {
+            if (s.size == file.size and
+                s.mtime.nanoseconds == file.mtime and
+                s.inode == file.inode)
             {
                 return false;
             } else {
-                try setStat(file, m, stat);
+                try setStat(file, m, s);
                 return true;
             }
         }
@@ -535,7 +564,7 @@ pub const Manifest = struct {
                 const prefix = fo.file_offset.get(contents).flags.prefix;
                 return .{
                     .root_dir = manifest.cache.prefixes()[prefix],
-                    .sub_path = filePath(contents, fo.file_offset),
+                    .sub_path = fo.file_offset.path(contents),
                 };
             }
         };
@@ -680,6 +709,21 @@ pub const Manifest = struct {
         _ = try addInputPath(m, opt_path orelse return, options);
     }
 
+    pub const CheckResult = union(enum) {
+        hit,
+        incomplete_manifest,
+        path_deleted: File.Offset,
+        directory_status_changed: File.Offset,
+        metadata_changed: File.Offset,
+        contents_changed: File.Offset,
+    };
+
+    pub const CheckError = error{
+        /// Unable to check the cache for a reason that has been recorded into
+        /// the `diagnostic` field.
+        CacheCheckFailed,
+    } || Allocator.Error || Io.Cancelable;
+
     /// Check the cache to see if the input exists in it.
     /// A hex encoding of its hash is available by calling `final`.
     ///
@@ -692,13 +736,13 @@ pub const Manifest = struct {
     /// The lock on the manifest file is released when `deinit` is called. As another
     /// option, one may call `toOwnedLock` to obtain a smaller object which can represent
     /// the lock. `deinit` is safe to call whether or not `toOwnedLock` has been called.
-    pub fn check(man: *Manifest, parent_progress_node: std.Progress.Node) Check.Error!Check.Status {
+    pub fn check(man: *Manifest, parent_progress_node: std.Progress.Node) CheckError!CheckResult {
         const node = parent_progress_node.start("Reusing Cache Artifacts", 0);
         defer node.end();
         return checkProgressless(man);
     }
 
-    pub fn checkProgressless(man: *Manifest) Check.Error!Check.Status {
+    pub fn checkProgressless(man: *Manifest) CheckError!CheckResult {
         assert(man.manifest_file == null);
 
         // This is *not* hashing the contents of the input files. It is the
@@ -798,16 +842,18 @@ pub const Manifest = struct {
         // files, so the caller can call `final`. Otherwise, on a cache miss, `man.hash.hasher` will include the digests
         // of all non-discovered files -- that is, the ones we've already been told about. The rest will be discovered
         // through calls to `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user
-        // can use `final`, and will at some point `writeManifest` the file list to disk.
+        // can use `final`, and will at some point `finalize` the file list to disk.
 
         man.hash.hasher = hasher_init;
         man.hash.hasher.update(&input_digest);
 
         hit: {
-            digests: {
-                switch (try man.checkLocked()) {
-                    .hit => break :hit,
-                    .miss => if (!try man.upgradeToExclusiveLock()) break :digests,
+            const miss_result = miss: {
+                const result = try man.checkLocked();
+                if (result == .hit) {
+                    break :hit;
+                } else if (!try man.upgradeToExclusiveLock()) {
+                    break :miss result;
                 }
                 // We've just had a miss with the shared lock, and upgraded to an exclusive lock. Someone
                 // else might have modified the digest, so we need to check again before deciding to miss.
@@ -816,18 +862,16 @@ pub const Manifest = struct {
                 man.hash.hasher = hasher_init;
                 man.hash.hasher.update(&input_digest);
                 man.shrinkFilesToInput();
-                switch (try man.checkLocked()) {
-                    .hit => break :hit,
-                    .miss => break :digests,
-                }
-            }
+                const refreshed_result = try man.checkLocked();
+                if (refreshed_result == .hit) break :hit;
+                break :miss refreshed_result;
+            };
 
-            // Cache miss. `checkLocked` guarantees that all input files have their digests populated
-            // unless it returns an error.
-            man.manifest_dirty = true;
-            // All input file digests are already populated by `checkLocked`, so we can call `unhit` directly.
+            // Cache miss, but `checkLocked` guarantees that all input files have their digests computed, even on a
+            // cache miss, which is needed because they will be used in the manifest digest.
+            man.dirty = true;
             unhit(man, &input_digest);
-            return .miss;
+            return miss_result;
         }
 
         if (man.want_shared_lock) {
@@ -852,127 +896,454 @@ pub const Manifest = struct {
 
     /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
     /// `self.files` contains only the original input files.
-    fn checkLocked(m: *Manifest) Check.Error!Check.Status {
+    fn checkLocked(m: *Manifest) CheckError!CheckResult {
         const gpa = m.cache.gpa;
         const io = m.cache.io;
         const manifest_file = m.manifest_file.?;
 
         const manifest_size = if (manifest_file.stat(io)) |stat| stat.size else |err| switch (err) {
             error.Canceled => |e| return e,
-            else => |e| {
-                m.diagnostic = .{ .manifest_stat = e };
-                return error.CacheCheckFailed;
-            },
+            else => |e| return fail(&m.diagnostic, .{ .manifest_stat = e }),
         };
 
-        // We always want to compute the input file hash digests, even on a cache miss, because they will be
-        // used in the manifest digest.
-
         if (manifest_size == 0 or manifest_size < m.contents.items.len) {
-            // Don't clobber our input files by overwriting contents since it's a cache miss.
+            // Manifest file was never finalized.
             try m.contents.ensureUnusedCapacity(gpa, 1);
-            return .miss;
+            return .incomplete_manifest;
         }
 
-        // Already supposedly includes the extra null byte that we have to maintain.
-        try m.contents.resize(gpa, manifest_size);
-
+        // We must not clobber existing `Manifest.contents` because it possibly contains prepopulated stat and digest
+        // information which we must compare with the file system. Since non input files are typically greater in number
+        // than input files, the strategy here is to move the contents to make room for entirety of the manifest
+        // contents on disk, and then later truncate the contents array.
+        //
+        // The file on disk already supposedly includes the extra null byte that we have to maintain.
+        const input_contents_len = m.contents.len;
+        // After this resize, every return statement needs to modify m.contents length.
+        try m.contents.resize(gpa, input_contents_len + manifest_size);
+        errdefer m.contents.shrinkRetainingCapacity(input_contents_len);
+        @memcpy(m.contents.items[manifest_size..][0..input_contents_len], m.contents.items[0..input_contents_len]);
         {
             const n = manifest_file.readPositionalAll(io, m.contents.items, 0) catch |err| switch (err) {
                 error.Canceled => |e| return e,
-                else => |e| {
-                    m.diagnostic = .{ .manifest_read = e };
-                    return error.CacheCheckFailed;
-                },
+                else => |e| return fail(&m.diagnostic, .{ .manifest_read = e }),
             };
-            m.contents.shrinkRetainingCapacity(n);
+            if (n != manifest_size) return checkLockedMiss(m, input_contents_len, .incomplete_manifest);
         }
-        const contents = m.contents.items;
+        const disk_contents = m.contents.items[0..manifest_size];
+        const input_contents = m.contents.items[manifest_size..input_contents_len];
 
+        // First the input files section, which must match our input files, otherwise it's invalid or incomplete.
         var off: usize = 0;
-        var c: Check = .{};
+        for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len], 0..) |*input_path, file_off, i| {
+            if (@backingInt(file_off) + 1 >= disk_contents.len)
+                return missInput(m, i, input_contents_len, manifest_size, .incomplete_manifest);
+            if (!mem.eql(u8, file_off.flagsAndPath(disk_contents), file_off.flagsAndPath(input_contents)))
+                return missInput(m, i, input_contents_len, manifest_size, .invalid_manifest);
 
-        // First the input files section, which must match our input files, otherwise it's invalid format.
-        for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len]) |*input_path, input_file_off| {
-            if (off + 1 >= contents.len) return error.InvalidFormat;
-            const file_off: File.Offset = @fromBackingInt(@intCast(off));
-            const file = try file_off.getFallible(contents);
-            if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
-            const path = try filePathFallible(contents, file_off);
-            if (path.len == 0) return error.InvalidFormat;
-            if (input_file_off != file_off) return error.InvalidFormat;
-
-            try checkInputFile(m, &c, file_off, path, input_path);
-
-            off += File.sizeOf(path.len);
+            const result = try checkInputPath(m, file_off, input_path, disk_contents, input_contents);
+            if (result != .hit) return missInput(m, i + 1, input_contents_len, manifest_size, result);
+            off = @backingInt(file_off);
         }
-
-        if (c.status == .miss) return .miss;
-        if (m.diagnostic != .none) return error.CacheCheckFailed;
 
         // Guess number of files based on manifest contents len to reduce allocations.
         // This is not an upper bound; subsequent insertions may potentially allocate.
-        try m.files.ensureUnusedCapacityContext(gpa, contents.len / (@sizeOf(File) + 32), .{
-            .contents = contents,
+        try m.files.ensureUnusedCapacityContext(gpa, disk_contents.len / (@sizeOf(File) + 32), .{
+            .contents = disk_contents,
         });
 
-        // Validate and count discovered files.
-        while (off + 1 < contents.len) {
+        // Validate and check discovered files.
+        while (off + 1 < disk_contents.len) {
             const file_off: File.Offset = @fromBackingInt(@intCast(off));
-            const file = try file_off.getFallible(contents);
-            if (file.flags.prefix >= m.cache.prefixes_len) return error.InvalidFormat;
-            const path = try filePathFallible(contents, file_off);
-            if (path.len == 0) return error.InvalidFormat;
+            const file = try file_off.getFallible(disk_contents);
+            if (file.flags.prefix >= m.cache.prefixes_len)
+                return checkLockedMiss(m, input_contents_len, .invalid_manifest);
+            const path = try file_off.pathFallible(disk_contents);
+            if (path.len == 0) return checkLockedMiss(m, input_contents_len, .invalid_manifest);
 
-            try m.files.putContext(gpa, file_off, {}, .{ .contents = contents });
-            switch (try checkFile(m, &c, file_off, filePath(contents, file_off))) {
-                .hit => {},
-                .miss => return .miss,
-            }
+            try m.files.putContext(gpa, file_off, {}, .{ .contents = disk_contents });
+            const result = try checkDiscoveredPath(file_off, file_off.path(disk_contents));
+            if (result != .hit) return checkLockedMiss(m, input_contents_len, result);
 
             off += File.sizeOf(path.len);
         }
 
         // Final terminating zero byte to distinguish empty manifest file from
         // manifest with zero files.
-        const file_valid = off + 1 == contents.len and contents[off] == 0;
-        if (!file_valid) return .miss;
+        const file_valid = off + 1 == disk_contents.len and disk_contents[off] == 0;
+        if (!file_valid) return checkLockedMiss(m, input_contents_len, .incomplete_manifest);
 
-        for (m.files.keys()) |file_off| m.hash.hasher.update(&file_off.get(contents).digest);
+        for (m.files.keys()) |file_off| m.hash.hasher.update(&file_off.get(disk_contents).digest);
 
-        // Don't track the trailing zero byte in contents.
-        m.contents.items.len -= 1;
-
+        // Since it's a cache hit, we accept the input file contents from disk and discard the other copy.
+        // Furthermore, don't track the trailing zero byte in contents.
+        m.contents.shrinkRetainingCapacity(manifest_size - 1);
         return .hit;
     }
 
-    fn checkInputFile(
+    /// Restore input file contents to prepare for cache miss workflow. We want to keep everything prior to `off` to
+    /// avoid redundant computation of digest and stat.
+    ///
+    /// Furthermore, this function is responsible for populating the remaining input file digests and metadata after the
+    /// missed one.
+    fn missInput(
         m: *Manifest,
-        c: *Check,
+        next_file_index: usize,
+        input_contents_len: usize,
+        manifest_size: usize,
+        result: CheckResult,
+    ) CheckError!CheckResult {
+        const file_offs = m.files.keys();
+        const off = if (file_offs.len - next_file_index == 0) input_contents_len else file_offs[next_file_index];
+        const copy_len = input_contents_len - off;
+        @memcpy(
+            m.contents.items[off..][0..copy_len],
+            m.contents.items[manifest_size + off ..][0..copy_len],
+        );
+        m.contents.shrinkRetainingCapacity(input_contents_len);
+        // And now iterate over remaining input files and populate the missing input file hashes.
+        const contents = m.contents.items;
+        for (file_offs[next_file_index..], m.input_paths.items) |input_file_off, *input_path| {
+            assert(@backingInt(input_file_off) == off);
+            try populateInputPath(m, input_file_off, input_path, contents);
+        }
+        return result;
+    }
+
+    fn checkLockedMiss(m: *Manifest, input_contents_len: usize, result: CheckResult) CheckResult {
+        m.contents.shrinkRetainingCapacity(input_contents_len);
+        return result;
+    }
+
+    /// Similar to `checkInputPath` and `checkDiscoveredPath` but does not compare metadata or digest against file
+    /// system. Only ensures that metadata and digest are available.
+    fn populateInputPath(
+        m: *Manifest,
         file_off: File.Offset,
-        file_path: [:0]const u8,
         input_path: *InputPath,
-    ) CheckFileError!void {
-        if (input_path.have_handle) @panic("TODO");
-        if (input_path.have_stat) @panic("TODO");
-        if (input_path.contents.status != .unrequested) @panic("TODO");
-        if (input_path.request_handle) @panic("TODO");
-        switch (try checkFile(m, c, file_off, file_path)) {
-            .hit => {},
-            .miss => c.status = .miss,
+        contents: []const u8,
+    ) CheckError!void {
+        const cache = m.cache;
+        const io = cache.io;
+        const input_file = file_off.get(contents);
+        const parent_dir = cache.prefixes()[input_file.flags.prefix].handle;
+        const file_path = file_off.path(contents);
+
+        if (input_path.have_digest) return;
+
+        const stat_path_ok = input_path.contents.status.populated() or input_file.flags.metadata_only;
+        if (!input_path.have_stat and stat_path_ok) {
+            // Since this is an input file, FileNotFound counts as a failure, not a cache miss.
+            const actual_stat = switch (input_path.getHandle(input_file)) {
+                .none => parent_dir.statFile(io, file_path, .{}) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                },
+                .file => |opened_file| opened_file.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                },
+                .dir => |opened_dir| opened_dir.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                },
+            };
+            const actual_is_directory = actual_stat.kind == .directory;
+            if (actual_is_directory != input_file.flags.is_directory) {
+                // Since this is an input file, this is a failure, not a cache miss.
+                return fail(&m.diagnostic, .{ .file_stat = .{
+                    .file_offset = file_off,
+                    .err = if (actual_is_directory) error.IsDir else error.NotDir,
+                } });
+            }
+            try input_file.setStat(m, .init(actual_stat));
+        }
+
+        if (input_file.flags.metadata_only) {
+            assert(stat_path_ok);
+            input_file.hashFromMetadata();
+            return;
+        }
+
+        if (input_path.contents.get()) |file_or_dir_contents| {
+            assert(stat_path_ok);
+            var hasher = hasher_init;
+            hasher.update(file_or_dir_contents);
+            hasher.final(&input_file.digest);
+            return;
+        }
+
+        if (input_file.flags.is_directory) {
+            const opened_dir = if (input_path.have_handle)
+                input_path.handle.dir
+            else
+                parent_dir.openDir(io, file_path, .{
+                    .iterate = true,
+                    .access_sub_paths = false,
+                }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_open = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+            defer if (!input_path.request_handle) opened_dir.close(io) else {
+                input_path.handle = .{ .dir = opened_dir };
+                input_path.have_handle = true;
+            };
+
+            if (!input_path.have_stat) {
+                assert(!stat_path_ok);
+                const actual_stat = opened_dir.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+                try input_file.setStat(m, .init(actual_stat));
+            }
+
+            const dir_contents_start = m.all_input_content.items.len;
+            const gpa = cache.gpa;
+            hashDir(gpa, io, opened_dir, &input_file.digest, &m.all_input_content) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => |e| return e,
+                else => |e| return fail(&m.diagnostic, .{ .file_read = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+            defer if (input_path.contents.status == .requested) {
+                input_path.contents = .{ .populated = .{
+                    .off = @intCast(dir_contents_start),
+                    .len = @intCast(m.all_input_content.items.len - dir_contents_start),
+                } };
+            } else m.all_input_content.shrinkRetainingCapacity(dir_contents_start);
+        } else {
+            const opened_file = if (input_path.have_handle)
+                input_path.handle.file
+            else
+                parent_dir.openFile(io, file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_open = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+            defer if (!input_path.request_handle) opened_file.close(io) else {
+                input_path.handle = .{ .file = opened_file };
+                input_path.have_handle = true;
+            };
+
+            if (!input_path.have_stat) {
+                assert(!stat_path_ok);
+                const actual_stat = opened_file.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+                try input_file.setStat(m, .init(actual_stat));
+            }
+
+            hashFile(io, opened_file, &input_file.digest) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return fail(&m.diagnostic, .{ .file_read = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+
+            if (input_path.contents.status == .requested) @panic("TODO");
         }
     }
 
-    const CheckFileError = error{ Canceled, CacheCheckFailed };
-
-    /// Runs concurrently with other `checkFile`.
-    fn checkFile(
+    /// Upon return, disk_contents digest and stat will be populated regardless of whether hit or miss occurs.
+    fn checkInputPath(
         m: *Manifest,
-        c: *Check,
+        file_off: File.Offset,
+        input_path: *InputPath,
+        disk_contents: []const u8,
+        input_contents: []const u8,
+    ) CheckError!CheckResult {
+        const cache = m.cache;
+        const io = cache.io;
+        const disk_file = file_off.get(disk_contents);
+        const input_file = file_off.get(input_contents);
+        const parent_dir = cache.prefixes()[disk_file.flags.prefix].handle;
+        const file_path = file_off.path(disk_contents);
+
+        assert(disk_file.flags == input_file.flags);
+
+        if (input_path.have_digest) {
+            if (mem.eql(u8, &disk_file.digest, &input_file.digest))
+                return .hit;
+        }
+
+        if (input_path.have_stat) {
+            const changed = try disk_file.setStatChanged(m, input_file.stat);
+            if (!changed) return .hit;
+        }
+
+        if (disk_file.flags.metadata_only) {
+            if (!input_path.have_stat) {
+                // Since this is an input file, FileNotFound counts as a failure, not a cache miss.
+                const actual_stat = switch (input_path.getHandle(input_file)) {
+                    .none => parent_dir.statFile(io, file_path, .{}) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                            .file_offset = file_off,
+                            .err = e,
+                        } }),
+                    },
+                    .file => |opened_file| opened_file.stat(io) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                            .file_offset = file_off,
+                            .err = e,
+                        } }),
+                    },
+                    .dir => |opened_dir| opened_dir.stat(io) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                            .file_offset = file_off,
+                            .err = e,
+                        } }),
+                    },
+                };
+                // In the other case (have_stat=true), this check is redundant since we already asserted the flags are
+                // identical, which contains the prefix.
+                const actual_is_directory = actual_stat.kind == .directory;
+                if (actual_is_directory != disk_file.flags.is_directory) {
+                    // Since this is an input file, this is a failure, not a cache miss.
+                    return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = if (actual_is_directory) error.IsDir else error.NotDir,
+                    } });
+                }
+                const stat: Stat = .init(actual_stat);
+                const changed = try disk_file.setStatChanged(m, stat);
+                disk_file.hashFromMetadata();
+                if (!changed) return .hit;
+            }
+            return .{ .metadata_changed = file_off };
+        }
+
+        if (input_path.contents.get()) |file_or_dir_contents| {
+            var hasher = hasher_init;
+            hasher.update(file_or_dir_contents);
+            hasher.final(&disk_file.digest);
+
+            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            return .{ .contents_changed = file_off };
+        }
+
+        if (disk_file.flags.is_directory) {
+            const opened_dir = if (input_path.have_handle)
+                input_path.handle.dir
+            else
+                parent_dir.openDir(io, file_path, .{
+                    .iterate = true,
+                    .access_sub_paths = false,
+                }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_open = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+            defer if (!input_path.request_handle) opened_dir.close(io) else {
+                input_path.handle = .{ .dir = opened_dir };
+                input_path.have_handle = true;
+            };
+
+            if (!input_path.have_stat) {
+                const actual_stat = opened_dir.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+                if (!try disk_file.setStatChanged(m, .init(actual_stat))) return .hit;
+            }
+
+            const dir_contents_start = m.all_input_content.items.len;
+            const gpa = cache.gpa;
+            hashDir(gpa, io, opened_dir, &disk_file.digest, &m.all_input_content) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => |e| return e,
+                else => |e| return fail(&m.diagnostic, .{ .file_read = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+            defer if (input_path.contents.status == .requested) {
+                input_path.contents = .{ .populated = .{
+                    .off = @intCast(dir_contents_start),
+                    .len = @intCast(m.all_input_content.items.len - dir_contents_start),
+                } };
+            } else m.all_input_content.shrinkRetainingCapacity(dir_contents_start);
+
+            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            return .{ .contents_changed = file_off };
+        } else {
+            const opened_file = if (input_path.have_handle)
+                input_path.handle.file
+            else
+                parent_dir.openFile(io, file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_open = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+            defer if (!input_path.request_handle) opened_file.close(io) else {
+                input_path.handle = .{ .file = opened_file };
+                input_path.have_handle = true;
+            };
+
+            if (!input_path.have_stat) {
+                const actual_stat = opened_file.stat(io) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => |e| return fail(&m.diagnostic, .{ .file_stat = .{
+                        .file_offset = file_off,
+                        .err = e,
+                    } }),
+                };
+                if (!try disk_file.setStatChanged(m, .init(actual_stat))) return .hit;
+            }
+
+            hashFile(io, opened_file, &disk_file.digest) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return fail(&m.diagnostic, .{ .file_read = .{
+                    .file_offset = file_off,
+                    .err = e,
+                } }),
+            };
+            if (input_path.contents.status == .requested) @panic("TODO");
+
+            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            return .{ .contents_changed = file_off };
+        }
+    }
+
+    fn checkDiscoveredPath(
+        m: *Manifest,
         file_off: File.Offset,
         file_path: [:0]const u8,
-    ) CheckFileError!Check.Status {
-        const file = file_off.get(m.contents.items);
+        contents: []const u8,
+    ) CheckError!CheckResult {
+        const file = file_off.get(contents);
         const cache = m.cache;
         const gpa = cache.gpa;
         const io = cache.io;
@@ -980,20 +1351,21 @@ pub const Manifest = struct {
 
         if (file.flags.metadata_only) {
             const actual_stat = parent_dir.statFile(io, file_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return .miss,
+                error.FileNotFound => return .{ .path_deleted = file_off },
                 error.Canceled => |e| return e,
-                else => |e| return c.fail(m, .{ .file_stat = .{
+                else => |e| return fail(m, .{ .file_stat = .{
                     .file_offset = file_off,
                     .err = e,
                 } }),
             };
 
             const actual_is_directory = actual_stat.kind == .directory;
-            if (actual_is_directory != file.flags.is_directory) return .miss;
+            if (actual_is_directory != file.flags.is_directory) return .{ .directory_status_changed = file_off };
 
             const changed = try file.setStatChanged(m, .init(actual_stat));
             file.hashFromMetadata();
-            return if (changed) .miss else .hit;
+            if (changed) return .{ .metadata_changed = file_off };
+            return .hit;
         }
 
         if (file.flags.is_directory) {
@@ -1001,9 +1373,10 @@ pub const Manifest = struct {
                 .iterate = true,
                 .access_sub_paths = false,
             }) catch |err| switch (err) {
-                error.FileNotFound, error.NotDir => return .miss,
+                error.FileNotFound => return .{ .path_deleted = file_off },
+                error.NotDir => return .{ .directory_status_changed = file_off },
                 error.Canceled => |e| return e,
-                else => |e| return c.fail(m, .{ .file_open = .{
+                else => |e| return fail(m, .{ .file_open = .{
                     .file_offset = file_off,
                     .err = e,
                 } }),
@@ -1012,32 +1385,33 @@ pub const Manifest = struct {
 
             const actual_stat = opened_dir.stat(io) catch |err| switch (err) {
                 error.Canceled => |e| return e,
-                else => |e| return c.fail(m, .{ .file_stat = .{
+                else => |e| return fail(m, .{ .file_stat = .{
                     .file_offset = file_off,
                     .err = e,
                 } }),
             };
             if (try file.setStatChanged(m, .init(actual_stat))) {
                 const prev_digest: BinDigest = file.digest;
-                var contents: std.ArrayList(u8) = .empty;
-                defer contents.deinit(gpa);
-                hashDir(gpa, io, opened_dir, &file.digest, &contents) catch |err| switch (err) {
-                    error.Canceled => |e| return e,
-                    else => |e| return c.fail(m, .{ .file_read = .{
+                const dir_contents_start = m.all_input_content.items.len;
+                defer m.all_input_content.shrinkRetainingCapacity(dir_contents_start);
+                hashDir(gpa, io, opened_dir, &file.digest, &m.all_input_contents) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => |e| return e,
+                    else => |e| return fail(m, .{ .file_read = .{
                         .file_offset = file_off,
                         .err = e,
                     } }),
                 };
 
-                if (!mem.eql(u8, &file.digest, &prev_digest)) return .miss;
+                if (!mem.eql(u8, &file.digest, &prev_digest)) return .{ .contents_changed = file_off };
             }
             return .hit;
         }
 
         const opened_file = parent_dir.openFile(io, file_path, .{ .mode = .read_only }) catch |err| switch (err) {
-            error.FileNotFound, error.IsDir => return .miss,
+            error.FileNotFound => return .{ .path_deleted = file_off },
+            error.IsDir => return .{ .directory_status_changed = file_off },
             error.Canceled => |e| return e,
-            else => |e| return c.fail(m, .{ .file_open = .{
+            else => |e| return fail(m, .{ .file_open = .{
                 .file_offset = file_off,
                 .err = e,
             } }),
@@ -1046,7 +1420,7 @@ pub const Manifest = struct {
 
         const actual_stat = opened_file.stat(io) catch |err| switch (err) {
             error.Canceled => |e| return e,
-            else => |e| return c.fail(m, .{ .file_stat = .{
+            else => |e| return fail(m, .{ .file_stat = .{
                 .file_offset = file_off,
                 .err = e,
             } }),
@@ -1056,19 +1430,25 @@ pub const Manifest = struct {
             const prev_digest: BinDigest = file.digest;
             hashFile(io, opened_file, &file.digest) catch |err| switch (err) {
                 error.Canceled => |e| return e,
-                else => |e| return c.fail(m, .{ .file_read = .{
+                else => |e| return fail(m, .{ .file_read = .{
                     .file_offset = file_off,
                     .err = e,
                 } }),
             };
 
-            if (!mem.eql(u8, &file.digest, &prev_digest)) return .miss;
+            if (!mem.eql(u8, &file.digest, &prev_digest)) return .{ .contents_changed = file_off };
         }
 
         return .hit;
     }
 
-    /// Reset `man.hash.hasher` to the state it should be in after `check` returns `Check.Status.miss`.
+    fn fail(ptr: *Diagnostic, d: Diagnostic) error{CacheCheckFailed} {
+        assert(ptr.* == .none);
+        ptr.* = d;
+        return error.CacheCheckFailed;
+    }
+
+    /// Reset `man.hash.hasher` to the state it should be in after `check` returns `CheckResult.miss`.
     /// The hasher contains the original input digest, and all original input file digests (i.e.
     /// not including discovered files).
     ///
@@ -1231,7 +1611,7 @@ pub const Manifest = struct {
                 try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
-                const sub_path = filePath(m.contents.items, file_offset);
+                const sub_path = file_offset.path(m.contents.items);
                 const handle = dir.openDir(io, sub_path, .{
                     .access_sub_paths = false,
                     .iterate = true,
@@ -1250,7 +1630,7 @@ pub const Manifest = struct {
                 try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
-                const sub_path = filePath(m.contents.items, file_offset);
+                const sub_path = file_offset.path(m.contents.items);
                 const handle = dir.openFile(io, sub_path, .{ .mode = .read_only }) catch |err| switch (err) {
                     error.Canceled => |e| return e,
                     else => |e| {
@@ -1420,18 +1800,18 @@ pub const Manifest = struct {
 
     /// If `want_shared_lock` is true, this function automatically downgrades the
     /// lock from exclusive to shared.
-    pub fn writeManifest(m: *Manifest) !void {
+    pub fn finalize(m: *Manifest) !void {
         assert(m.have_exclusive_lock);
         const io = m.cache.io;
         const manifest_file = m.manifest_file.?;
-        if (m.manifest_dirty) {
+        if (m.dirty) {
             m.contents.appendAssumeCapacity(0);
             defer _ = m.contents.pop().?;
 
             try manifest_file.setLength(io, m.contents.items.len);
             try manifest_file.writePositionalAll(io, m.contents.items, 0);
 
-            m.manifest_dirty = false;
+            m.dirty = false;
         }
 
         if (m.want_shared_lock) {
@@ -1473,7 +1853,7 @@ pub const Manifest = struct {
     /// Obtain only the data needed to maintain a lock on the manifest file.
     /// The `Manifest` remains safe to deinit.
     ///
-    /// Don't forget to call `writeManifest` before this!
+    /// Don't forget to call `finalize` before this!
     pub fn toOwnedLock(self: *Manifest) Lock {
         defer self.manifest_file = null;
         return .{ .manifest_file = self.manifest_file.? };
@@ -1496,7 +1876,7 @@ pub const Manifest = struct {
         }
 
         pub fn path(scf: *const SelfContainedFiles, file_offset: File.Offset) [:0]const u8 {
-            return filePath(scf.contents.items, file_offset);
+            return file_offset.path(scf.contents.items);
         }
     };
 
@@ -1516,7 +1896,7 @@ pub const Manifest = struct {
     /// Releases the manifest file and frees any memory the Manifest was using.
     /// `Manifest.hit` must be called first.
     ///
-    /// Don't forget to call `writeManifest` before this!
+    /// Don't forget to call `finalize` before this!
     pub fn deinit(m: *Manifest) void {
         const io = m.cache.io;
         const gpa = m.cache.gpa;
@@ -1544,7 +1924,7 @@ pub const Manifest = struct {
         if (files.len > 0) {
             const contents = man.contents.items;
             for (files) |file| {
-                const file_path = filePath(contents, file);
+                const file_path = file.path(contents);
                 try buf.ensureUnusedCapacity(gpa, file_path.len + 2);
                 buf.appendAssumeCapacity(@as(u8, file.get(contents).flags.prefix) + 1);
                 buf.appendSliceAssumeCapacity(file_path);
@@ -1675,22 +2055,7 @@ pub const Manifest = struct {
     }
 
     fn hashFlagsAndPath(m: *const Manifest, off: File.Offset, hasher: *Hasher) void {
-        const contents = m.contents.items;
-        const flags_off = @offsetOf(File, "flags");
-        comptime assert(@offsetOf(File, "path_start") - flags_off == 1);
-        const hash_start = @backingInt(off) + flags_off;
-        const hash_end = mem.findScalarPos(u8, contents, hash_start, 0).?;
-        hasher.update(contents[hash_start..hash_end]);
-    }
-
-    pub fn filePathFallible(contents: []const u8, off: File.Offset) error{InvalidFormat}![:0]const u8 {
-        const path_start = @backingInt(off) + @offsetOf(File, "path_start");
-        const path_end = mem.findScalarPos(u8, contents, path_start, 0) orelse return error.InvalidFormat;
-        return contents[path_start..path_end :0];
-    }
-
-    fn filePath(contents: []const u8, off: File.Offset) [:0]const u8 {
-        return filePathFallible(contents, off) catch unreachable;
+        hasher.update(off.flagsAndPath(m.contents.items));
     }
 };
 
@@ -1756,7 +2121,7 @@ test "cache file and then recall it" {
             try testing.expectEqual(.miss, try ch.check(.none));
 
             digest1 = ch.final();
-            try ch.writeManifest();
+            try ch.finalize();
         }
         {
             var ch = cache.obtain();
@@ -1827,7 +2192,7 @@ test "check that changing a file makes cache fail" {
 
             digest1 = man.final();
 
-            try man.writeManifest();
+            try man.finalize();
         }
 
         try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = updated_temp_file_contents });
@@ -1847,7 +2212,7 @@ test "check that changing a file makes cache fail" {
 
             digest2 = man.final();
 
-            try man.writeManifest();
+            try man.finalize();
         }
 
         try testing.expect(!mem.eql(u8, digest1[0..], digest2[0..]));
@@ -1888,7 +2253,7 @@ test "no file inputs" {
 
         digest1 = man.final();
 
-        try man.writeManifest();
+        try man.finalize();
     }
     {
         var man = cache.obtain();
@@ -1953,7 +2318,7 @@ test "Manifest with files added after initial hash work" {
             _ = try ch.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(temp_file2) } });
 
             digest1 = ch.final();
-            try ch.writeManifest();
+            try ch.finalize();
         }
         {
             var ch = cache.obtain();
@@ -1992,7 +2357,7 @@ test "Manifest with files added after initial hash work" {
 
             digest3 = ch.final();
 
-            try ch.writeManifest();
+            try ch.finalize();
         }
 
         try testing.expect(!mem.eql(u8, &digest1, &digest3));

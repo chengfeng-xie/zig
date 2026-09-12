@@ -938,7 +938,7 @@ pub const Manifest = struct {
         if (manifest_size == 0 or manifest_size < m.contents.items.len) {
             // Manifest file was never finalized.
             try m.contents.ensureUnusedCapacity(gpa, 1);
-            return .incomplete_manifest;
+            return missInput(m, 0, m.contents.items.len, manifest_size, .incomplete_manifest);
         }
 
         // We must not clobber existing `Manifest.contents` because it possibly contains prepopulated stat and digest
@@ -1030,14 +1030,14 @@ pub const Manifest = struct {
         else
             @backingInt(file_offs[next_file_index]);
         const copy_len = input_contents_len - off;
-        @memcpy(
+        if (manifest_size > 0) @memcpy(
             m.contents.items[off..][0..copy_len],
             m.contents.items[manifest_size + off ..][0..copy_len],
         );
         m.contents.shrinkRetainingCapacity(input_contents_len);
         // And now iterate over remaining input files and populate the missing input file hashes.
         const contents = m.contents.items;
-        for (file_offs[next_file_index..], m.input_paths.items) |input_file_off, *input_path| {
+        for (file_offs[next_file_index..], m.input_paths.items[next_file_index..]) |input_file_off, *input_path| {
             assert(@backingInt(input_file_off) == off);
             try populateInputPath(m, input_file_off, input_path, contents);
         }
@@ -2214,6 +2214,11 @@ test "check that changing a file makes cache fail" {
     const updated_temp_file_contents = "Hello, world; but updated!\n";
 
     try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = original_temp_file_contents });
+    const tmp_directory: Directory = .{
+        .path = try std.fs.path.join(testing.allocator, &.{std.testing.TmpDir.parent_dir_path}),
+        .handle = tmp.dir,
+    };
+    defer testing.allocator.free(tmp_directory.path.?);
 
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
@@ -2231,7 +2236,8 @@ test "check that changing a file makes cache fail" {
             .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
             .cwd = cwd,
         };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+        cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+        cache.addPrefix(tmp_directory);
         defer cache.manifest_dir.close(io);
 
         {
@@ -2239,7 +2245,10 @@ test "check that changing a file makes cache fail" {
             defer man.deinit();
 
             man.hash.addBytes("1234");
-            const temp_file_idx = try man.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
+            const temp_file_idx = try man.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file,
+            }, .{ .request_contents = true });
 
             try testing.expectEqual(.incomplete_manifest, try man.check(.none));
 
@@ -2257,7 +2266,10 @@ test "check that changing a file makes cache fail" {
             defer man.deinit();
 
             man.hash.addBytes("1234");
-            const temp_file_idx = try man.addInputPath(.initCwd(temp_file), .{ .request_contents = true });
+            const temp_file_idx = try man.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file,
+            }, .{ .request_contents = true });
 
             // The one input file changed.
             try testing.expectEqual(
@@ -2340,6 +2352,11 @@ test "Manifest with files added after initial hash work" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = temp_file1, .data = "Hello, world!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = temp_file2, .data = "Hello world the second!\n" });
+    const tmp_directory: Directory = .{
+        .path = try std.fs.path.join(testing.allocator, &.{std.testing.TmpDir.parent_dir_path}),
+        .handle = tmp.dir,
+    };
+    defer testing.allocator.free(tmp_directory.path.?);
 
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
@@ -2358,7 +2375,8 @@ test "Manifest with files added after initial hash work" {
             .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
             .cwd = cwd,
         };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+        cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+        cache.addPrefix(tmp_directory);
         defer cache.manifest_dir.close(io);
 
         {
@@ -2366,11 +2384,17 @@ test "Manifest with files added after initial hash work" {
             defer man.deinit();
 
             man.hash.addBytes("1234");
-            _ = try man.addInputPath(.initCwd(temp_file1), .{});
+            _ = try man.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file1,
+            }, .{});
 
             try testing.expectEqual(.incomplete_manifest, try man.check(.none));
 
-            try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(temp_file2) } });
+            try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file2,
+            } } });
 
             digest1 = man.final();
             try man.finalize();
@@ -2380,7 +2404,10 @@ test "Manifest with files added after initial hash work" {
             defer man.deinit();
 
             man.hash.addBytes("1234");
-            _ = try man.addInputPath(.initCwd(temp_file1), .{});
+            _ = try man.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file1,
+            }, .{});
 
             try testing.expect(.hit == try man.check(.none));
             digest2 = man.final();
@@ -2403,7 +2430,10 @@ test "Manifest with files added after initial hash work" {
             defer man.deinit();
 
             man.hash.addBytes("1234");
-            _ = try man.addInputPath(.initCwd(temp_file1), .{});
+            _ = try man.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file1,
+            }, .{});
 
             switch (try man.check(.none)) {
                 .contents_changed => |off| {
@@ -2412,7 +2442,10 @@ test "Manifest with files added after initial hash work" {
                 else => return error.TestFailed,
             }
 
-            try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(temp_file2) } });
+            try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file2,
+            } } });
 
             digest3 = man.final();
 

@@ -165,7 +165,7 @@ pub fn make(
 
     maker.generatedPath(conf_oc.output_file).* = dest_path;
 
-    step.writeManifest(maker, &man) catch |err| switch (err) {
+    step.finalizeManifest(maker, &man) catch |err| switch (err) {
         error.Canceled => |e| return e,
         else => |e| try step.addError(maker, "failed writing cache manifest: {t}", .{e}),
     };

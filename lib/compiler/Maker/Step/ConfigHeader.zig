@@ -169,7 +169,7 @@ pub fn make(
         .sub_path = try Io.Dir.path.join(arena, &.{ "o", &digest }),
     };
 
-    try step.writeManifest(maker, &man);
+    try step.finalizeManifest(maker, &man);
 }
 
 fn ensureAllValuesUsed(

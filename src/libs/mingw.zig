@@ -363,9 +363,8 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8, prog_node: std.P
         try file_writer.interface.flush();
     }
 
-    man.writeManifest() catch |err| {
-        log.warn("failed to write cache manifest for DLL import {s}.lib: {s}", .{ lib_name, @errorName(err) });
-    };
+    man.finalize() catch |err|
+        log.warn("failed to write cache manifest for DLL import {s}.lib: {t}", .{ lib_name, err });
 
     comp.mutex.lockUncancelable(io);
     defer comp.mutex.unlock(io);

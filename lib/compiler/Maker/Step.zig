@@ -734,7 +734,7 @@ pub fn cacheHit(s: *Step, maker: *Maker, man: *Cache.Manifest, parent_progress_n
 /// Clears previous watch inputs, if any, and then populates watch inputs from
 /// the full set of files picked up by the cache manifest.
 ///
-/// Must be accompanied with `writeManifestAndWatch`.
+/// Must be accompanied with `finalizeManifestAndWatch`.
 pub fn cacheHitWatched(s: *Step, maker: *Maker, man: *Cache.Manifest, parent_progress_node: std.Progress.Node) !bool {
     const hit = .hit == (man.check(parent_progress_node) catch |err| return failWithCacheError(s, maker, man, err));
     s.result_cached = hit;
@@ -748,7 +748,7 @@ fn failWithCacheError(
     s: *Step,
     maker: *Maker,
     man: *const Cache.Manifest,
-    err: Cache.Manifest.Check.Error,
+    err: Cache.Manifest.CheckError,
 ) error{ OutOfMemory, Canceled, MakeFailed } {
     switch (err) {
         error.CacheCheckFailed => switch (man.diagnostic) {
@@ -762,15 +762,14 @@ fn failWithCacheError(
             },
         },
         error.OutOfMemory, error.Canceled => |e| return e,
-        error.InvalidFormat => return s.fail(maker, "failed checking cache: invalid manifest file format", .{}),
     }
 }
 
-/// Prefer `writeManifestAndWatch` unless you already added watch inputs
+/// Prefer `finalizeManifestAndWatch` unless you already added watch inputs
 /// separately from using the cache system.
-pub fn writeManifest(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
+pub fn finalizeManifest(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
     if (s.test_results.isSuccess()) {
-        man.writeManifest() catch |err| switch (err) {
+        man.finalize() catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => |e| try s.addError(maker, "failed writing cache manifest: {t}", .{e}),
         };
@@ -781,8 +780,8 @@ pub fn writeManifest(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
 /// the full set of files picked up by the cache manifest.
 ///
 /// Must be accompanied with `cacheHitWatched`.
-pub fn writeManifestAndWatch(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
-    try writeManifest(s, maker, man);
+pub fn finalizeManifestAndWatch(s: *Step, maker: *Maker, man: *Cache.Manifest) !void {
+    try finalizeManifest(s, maker, man);
     try setWatchInputsFromManifest(s, maker, man);
 }
 

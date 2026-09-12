@@ -1543,7 +1543,7 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
                     config_tmp_path, final_path, e,
                 });
             };
-            man.writeManifest() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
+            man.finalize() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
             options.src_files.* = man.takeFiles();
             break :cp .{ final_path, man.toOwnedLock() };
         }
@@ -1934,7 +1934,7 @@ fn cacheCatOne(input_hex_digest: []const u8, contents: []const u8, writer: *Io.W
     while (off + 1 < contents.len) {
         const file_off: Cache.Manifest.File.Offset = @fromBackingInt(@intCast(off));
         const file = try file_off.getFallibleConst(contents);
-        const path = try Cache.Manifest.filePathFallible(contents, file_off);
+        const path = try file_off.pathFallible(contents);
         if (path.len == 0) return error.InvalidFormat;
 
         var file_obj = try files_tuple.beginStructField(.{ .whitespace_style = .{ .wrap = false } });

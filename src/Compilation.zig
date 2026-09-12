@@ -2851,7 +2851,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             log.debug("CacheMode.whole cache miss for {s}", .{comp.root_name});
 
             if (ignore_hit) {
-                // Okay, now set this back so that `writeManifest` will downgrade our lock later.
+                // Okay, now set this back so that `Manifest.finalize` will downgrade our lock later.
                 man.want_shared_lock = true;
             }
 
@@ -3128,7 +3128,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             if (anyErrors(comp)) return;
 
             // Failure here only means an unnecessary cache miss.
-            man.writeManifest() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
+            man.finalize() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
 
             assert(whole.lock == null);
             whole.lock = man.toOwnedLock();
@@ -5794,11 +5794,8 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: std.Pr
         // possible we had a hit and the manifest is dirty, for example if the file mtime changed but
         // the contents were the same, we hit the cache but the manifest is dirty and we need to update
         // it to prevent doing a full file content comparison the next time around.
-        man.writeManifest() catch |err| {
-            log.warn("failed to write cache manifest when compiling '{s}': {s}", .{
-                c_object.src.src_path, @errorName(err),
-            });
-        };
+        man.finalize() catch |err|
+            log.warn("failed to write cache manifest when compiling {q}: {t}", .{ c_object.src.src_path, err });
     }
 
     const o_basename = try std.fmt.allocPrint(arena, "{s}{s}", .{ o_basename_noext, o_ext });
@@ -5934,9 +5931,8 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
         };
 
         if (man.have_exclusive_lock) {
-            man.writeManifest() catch |err| {
-                log.warn("failed to write cache manifest when compiling '{s}': {s}", .{ src_path, @errorName(err) });
-            };
+            man.finalize() catch |err|
+                log.warn("failed to write cache manifest when compiling {q}: {t}", .{ src_path, err });
         }
 
         win32_resource.status = .{
@@ -6044,8 +6040,8 @@ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32
         // possible we had a hit and the manifest is dirty, for example if the file mtime changed but
         // the contents were the same, we hit the cache but the manifest is dirty and we need to update
         // it to prevent doing a full file content comparison the next time around.
-        man.writeManifest() catch |err| {
-            log.warn("failed to write cache manifest when compiling '{s}': {s}", .{ rc_src.src_path, @errorName(err) });
+        man.finalize() catch |err| {
+            log.warn("failed to write cache manifest when compiling {q}: {t}", .{ rc_src.src_path, err });
         };
     }
 

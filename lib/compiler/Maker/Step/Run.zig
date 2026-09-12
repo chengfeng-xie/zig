@@ -275,7 +275,7 @@ pub fn make(
         try populateGeneratedStdIo(maker, &conf_run, cache_root, &digest);
         try populateGeneratedPathsCreateDirs(arena, run_index, maker, output_dir_path, output_placeholders.items, argv_list.items);
         try runCommand(arena, run, run_index, maker, progress_node, argv_list.items, has_side_effects, output_dir_path, null);
-        if (!has_side_effects) try step.writeManifestAndWatch(maker, &man);
+        if (!has_side_effects) try step.finalizeManifestAndWatch(maker, &man);
         return;
     }
 
@@ -344,7 +344,7 @@ pub fn make(
         };
     }
 
-    if (!has_side_effects) try step.writeManifestAndWatch(maker, &man);
+    if (!has_side_effects) try step.finalizeManifestAndWatch(maker, &man);
 
     try populateGeneratedStdIo(maker, &conf_run, cache_root, &digest);
     try populateGeneratedPaths(maker, output_placeholders.items, cache_root, &digest);

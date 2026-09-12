@@ -643,9 +643,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         try buildSharedLib(comp, arena, o_directory, asm_file_basename, lib, prog_node);
     }
 
-    man.writeManifest() catch |err| {
-        log.warn("failed to write cache manifest for NetBSD libc stubs: {s}", .{@errorName(err)});
-    };
+    man.finalize() catch |err| log.warn("failed to write cache manifest for NetBSD libc stubs: {t}", .{err});
 
     return queueSharedObjects(comp, .{
         .lock = man.toOwnedLock(),

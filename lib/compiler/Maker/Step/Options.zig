@@ -95,7 +95,7 @@ pub fn make(
         },
     };
 
-    try step.writeManifestAndWatch(maker, &man);
+    try step.finalizeManifestAndWatch(maker, &man);
 
     maker.generatedPath(conf_options.generated_file).* = out_path;
 }

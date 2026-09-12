@@ -122,7 +122,7 @@ pub fn make(
 
             progress_node.setEstimatedTotalItems(total_items);
             try operate(maker, step_index, open_dir_cache, out_path, progress_node);
-            try step.writeManifest(maker, &man);
+            try step.finalizeManifest(maker, &man);
 
             maker.generatedPath(conf_wf.generated_directory).* = out_path;
         },

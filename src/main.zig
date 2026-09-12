@@ -4892,7 +4892,7 @@ fn cmdTranslateC(
             }
         }
 
-        man.writeManifest() catch |err| warn("failed to write cache manifest: {t}", .{err});
+        man.finalize() catch |err| warn("failed to write cache manifest: {t}", .{err});
         break :result result;
     };
 

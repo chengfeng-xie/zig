@@ -418,18 +418,18 @@ pub const Manifest = struct {
 
     /// The data per tracked input file that is stored in the manifest file.
     pub const File = extern struct {
-        size: u64,
-        inode: u64,
+        size: u64 align(1),
+        inode: u64 align(1),
         /// Nanoseconds.
-        mtime: i64,
+        mtime: i64 align(1),
         /// To simplify the hashing logic, this value is computed from size, inode, and mtime
         /// in `hashFromMetadata` in the case that `Flags.metadata_only` is `true`.
-        digest: BinDigest,
+        digest: BinDigest align(1),
         /// Starting with this field and continuing into the path, excluding the null byte,
         /// is the string that is hashed for the manifest digest.
-        flags: Flags,
+        flags: Flags align(1),
         /// Terminated by zero byte, then followed by padding until 8-byte aligned.
-        path_start: [0]u8,
+        path_start: [0]u8 align(1),
 
         pub const Flags = packed struct(u8) {
             is_directory: bool,
@@ -2133,6 +2133,11 @@ test "cache file and then recall it" {
     const temp_manifest_dir = "temp_manifest_dir";
 
     try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = "Hello, world!\n" });
+    const tmp_directory: Directory = .{
+        .path = try std.fs.path.join(testing.allocator, &.{std.testing.TmpDir.parent_dir_path}),
+        .handle = tmp.dir,
+    };
+    defer testing.allocator.free(tmp_directory.path.?);
 
     // Wait for file timestamps to tick
     const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
@@ -2150,7 +2155,8 @@ test "cache file and then recall it" {
             .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
             .cwd = cwd,
         };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+        cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+        cache.addPrefix(tmp_directory);
         defer cache.manifest_dir.close(io);
 
         {
@@ -2160,7 +2166,10 @@ test "cache file and then recall it" {
             ch.hash.add(true);
             ch.hash.add(@as(u16, 1234));
             ch.hash.addBytes("1234");
-            _ = try ch.addInputPath(.initCwd(temp_file), .{});
+            _ = try ch.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file,
+            }, .{});
 
             try testing.expectEqual(.incomplete_manifest, try ch.check(.none));
 
@@ -2174,7 +2183,10 @@ test "cache file and then recall it" {
             ch.hash.add(true);
             ch.hash.add(@as(u16, 1234));
             ch.hash.addBytes("1234");
-            _ = try ch.addInputPath(.initCwd(temp_file), .{});
+            _ = try ch.addInputPath(.{
+                .root_dir = tmp_directory,
+                .sub_path = temp_file,
+            }, .{});
 
             // Cache hit! We just "built" the same file
             try testing.expectEqual(.hit, try ch.check(.none));

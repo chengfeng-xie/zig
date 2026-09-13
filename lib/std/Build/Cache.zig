@@ -1038,7 +1038,6 @@ pub const Manifest = struct {
         // And now iterate over remaining input files and populate the missing input file hashes.
         const contents = m.contents.items;
         for (file_offs[next_file_index..], m.input_paths.items[next_file_index..]) |input_file_off, *input_path| {
-            assert(@backingInt(input_file_off) == off);
             try populateInputPath(m, input_file_off, input_path, contents);
         }
         return result;

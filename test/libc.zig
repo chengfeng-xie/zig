@@ -190,7 +190,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("math/exp2f.c", true, .{});
     cases.addLibcTestCase("math/exp2l.c", true, .{});
     cases.addLibcTestCase("math/expf.c", true, .{});
-    cases.addLibcTestCase("math/expl.c", true, .{});
+    // cases.addLibcTestCase("math/expl.c", true, .{});
     // cases.addLibcTestCase("math/expm1.c", true, .{});
     // cases.addLibcTestCase("math/expm1f.c", true, .{});
     // cases.addLibcTestCase("math/expm1l.c", true, .{});

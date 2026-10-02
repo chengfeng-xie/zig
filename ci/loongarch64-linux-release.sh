@@ -7,7 +7,7 @@ set -e
 
 TARGET="loongarch64-linux-musl"
 MCPU="baseline"
-CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.17.0-dev.203+073889523"
+CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.18.0-dev.42+9baacc841"
 PREFIX="$HOME/deps/$CACHE_BASENAME"
 ZIG="$PREFIX/bin/zig"
 

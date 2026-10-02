@@ -7,7 +7,7 @@ set -e
 
 TARGET="aarch64-openbsd-none"
 MCPU="baseline"
-CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.17.0-dev.2030+f955266cf"
+CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.18.0-dev.42+9baacc841"
 PREFIX="$HOME/deps/$CACHE_BASENAME"
 ZIG="$PREFIX/bin/zig"
 

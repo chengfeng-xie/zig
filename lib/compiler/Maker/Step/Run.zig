@@ -2221,6 +2221,41 @@ fn runCommand(
         }
     }
 
+    if (graph.enable_qemu) runtime_dir: {
+        const libc_runtimes_dir = graph.libc_runtimes_dir orelse break :runtime_dir;
+        if (environ_map.contains("QEMU_LD_PREFIX")) break :runtime_dir;
+
+        const producer_index = arg0.producer.value orelse break :runtime_dir;
+        const producer_step = producer_index.ptr(conf);
+        const producer = producer_step.extended.get(conf.extra).compile;
+        switch (producer.flags3.kind) {
+            .exe, .@"test" => {},
+            else => break :runtime_dir,
+        }
+        const root_module = producer.root_module.get(conf);
+        const root_module_target = root_module.resolved_target.get(conf).?.result.get(conf);
+        const root_target = root_module_target.unwrapTarget(conf);
+        const config = maker.stepByIndex(producer_index).extended.compile.config.?;
+
+        const need_cross_libc = root_target.os.tag == .linux and
+            config.flags.link_libc and config.flags.link_mode == .dynamic;
+        if (!need_cross_libc) break :runtime_dir;
+
+        try environ_map.put("QEMU_LD_PREFIX", try Dir.path.join(graph.arena, &.{
+            libc_runtimes_dir,
+            try if (root_target.isGnuLibC()) std.zig.target.glibcRuntimeTriple(
+                graph.arena,
+                root_target.cpu.arch,
+                root_target.os.tag,
+                root_target.abi,
+            ) else if (root_target.isMuslLibC()) std.zig.target.muslRuntimeTriple(
+                graph.arena,
+                root_target.cpu.arch,
+                root_target.abi,
+            ) else unreachable,
+        }));
+    }
+
     const cwd_string = switch (cwd) {
         .path => |p| p,
         .dir => unreachable,

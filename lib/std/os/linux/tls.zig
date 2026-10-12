@@ -767,10 +767,10 @@ comptime {
             @export(&Fns.__tls_get_addr, .{ .name = "__tls_get_addr" });
             if (native_arch == .m68k) {
                 @export(&Fns.__m68k_read_tp, .{ .name = "__m68k_read_tp" });
-	        }
-	        if (native_arch == .x86) {
+            }
+            if (native_arch == .x86) {
                 @export(&Fns.___tls_get_addr, .{ .name = "___tls_get_addr" });
-	        }
+            }
         }
     }
 }

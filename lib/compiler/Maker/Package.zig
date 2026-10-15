@@ -8,15 +8,11 @@ pub const Fingerprint = packed struct(u64) {
     id: u32,
     checksum: u32,
 
-    pub fn init(id: u32, name: []const u8) Fingerprint {
+    pub fn generate(rng: std.Random, name: []const u8) Fingerprint {
         return .{
-            .id = id,
+            .id = rng.intRangeLessThan(u32, 1, 0xffffffff),
             .checksum = std.hash.Crc32.hash(name),
         };
-    }
-
-    pub fn generate(rng: std.Random, name: []const u8) Fingerprint {
-        return .init(rng.intRangeLessThan(u32, 1, 0xffffffff), name);
     }
 
     pub fn validate(n: Fingerprint, name: []const u8) bool {

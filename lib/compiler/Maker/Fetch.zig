@@ -290,10 +290,18 @@ pub const JobQueue = struct {
             , .{std.fmt.alt(fetch.package_root, .formatEscapeString)});
 
             if (fetch.has_build_zig) {
-                try w.print(
-                    \\        pub const build_zig = @import("{f}");
-                    \\
-                , .{std.zig.fmtString(hash_slice)});
+                const project_id: Package.ProjectId = .init(fetch.manifest.name, fetch.manifest.id);
+                if (jq.fork_set.getKeyPtrAdapted(project_id, @as(JobQueue.Fork.Adapter, .{}))) |fork| {
+                    try w.print(
+                        \\        pub const build_zig = @import({qf});
+                        \\
+                    , .{fork.path});
+                } else {
+                    try w.print(
+                        \\        pub const build_zig = @import({q});
+                        \\
+                    , .{hash_slice});
+                }
             }
 
             if (fetch.have_manifest) {

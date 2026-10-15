@@ -1387,32 +1387,34 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
                         }
                         if (!f.has_build_zig) continue;
 
-                        const project_id: Package.ProjectId = .init(f.manifest.name, f.manifest.id);
-                        if (fork_set.getKeyPtrAdapted(project_id, @as(Fetch.JobQueue.Fork.Adapter, .{}))) |fork| {
-                            const path = try fork.path.toString(arena);
-                            const gop = deps_mod.deps.getOrPutAssumeCapacity(path);
-                            if (gop.found_existing) {
-                                assert(fork.uses > 1);
-                                f.cli_module = gop.value_ptr.*;
-                            } else {
-                                const m = try arena.create(CliModule);
-                                m.* = .{
-                                    .root_path = try f.package_root.toString(arena),
-                                    .name = path,
-                                };
-                                gop.value_ptr.* = m;
-                                f.cli_module = m;
+                        if (f.have_manifest) {
+                            const project_id: Package.ProjectId = .init(f.manifest.name, f.manifest.id);
+                            if (fork_set.getKeyPtrAdapted(project_id, @as(Fetch.JobQueue.Fork.Adapter, .{}))) |fork| {
+                                const path = try fork.path.toString(arena);
+                                const gop = deps_mod.deps.getOrPutAssumeCapacity(path);
+                                if (gop.found_existing) {
+                                    assert(fork.uses > 1);
+                                    f.cli_module = gop.value_ptr.*;
+                                } else {
+                                    const m = try arena.create(CliModule);
+                                    m.* = .{
+                                        .root_path = try f.package_root.toString(arena),
+                                        .name = path,
+                                    };
+                                    gop.value_ptr.* = m;
+                                    f.cli_module = m;
+                                }
+                                continue;
                             }
-                        } else {
-                            const hash_slice = try arena.dupe(u8, hash.toSlice());
-                            const m = try arena.create(CliModule);
-                            m.* = .{
-                                .root_path = try f.package_root.toString(arena),
-                                .name = hash_slice,
-                            };
-                            deps_mod.deps.putAssumeCapacityNoClobber(hash_slice, m);
-                            f.cli_module = m;
                         }
+                        const hash_slice = try arena.dupe(u8, hash.toSlice());
+                        const m = try arena.create(CliModule);
+                        m.* = .{
+                            .root_path = try f.package_root.toString(arena),
+                            .name = hash_slice,
+                        };
+                        deps_mod.deps.putAssumeCapacityNoClobber(hash_slice, m);
+                        f.cli_module = m;
                     }
 
                     // Each build.zig module needs access to each of its dependencies' build.zig modules by

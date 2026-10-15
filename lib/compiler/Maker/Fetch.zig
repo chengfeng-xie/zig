@@ -289,19 +289,21 @@ pub const JobQueue = struct {
                 \\
             , .{std.fmt.alt(fetch.package_root, .formatEscapeString)});
 
-            if (fetch.has_build_zig) {
-                const project_id: Package.ProjectId = .init(fetch.manifest.name, fetch.manifest.id);
-                if (jq.fork_set.getKeyPtrAdapted(project_id, @as(JobQueue.Fork.Adapter, .{}))) |fork| {
-                    try w.print(
-                        \\        pub const build_zig = @import({qf});
-                        \\
-                    , .{fork.path});
-                } else {
-                    try w.print(
-                        \\        pub const build_zig = @import({q});
-                        \\
-                    , .{hash_slice});
+            if (fetch.has_build_zig) b: {
+                if (fetch.have_manifest) {
+                    const project_id: Package.ProjectId = .init(fetch.manifest.name, fetch.manifest.id);
+                    if (jq.fork_set.getKeyPtrAdapted(project_id, @as(JobQueue.Fork.Adapter, .{}))) |fork| {
+                        try w.print(
+                            \\        pub const build_zig = @import({qf});
+                            \\
+                        , .{fork.path});
+                    }
+                    break :b;
                 }
+                try w.print(
+                    \\        pub const build_zig = @import({q});
+                    \\
+                , .{hash_slice});
             }
 
             if (fetch.have_manifest) {

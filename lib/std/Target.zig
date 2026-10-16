@@ -3623,8 +3623,6 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) ?u16 {
             .sheb,
             .x86,
             .xcore,
-            .xtensa,
-            .xtensaeb,
             => 4,
 
             .amdgcn,
@@ -3645,6 +3643,8 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) ?u16 {
             .sparc,
             .thumb,
             .thumbeb,
+            .xtensa,
+            .xtensaeb,
             => 8,
 
             .aarch64,

@@ -297,8 +297,8 @@ pub const JobQueue = struct {
                             \\        pub const build_zig = @import({qf});
                             \\
                         , .{fork.path});
+                        break :b;
                     }
-                    break :b;
                 }
                 try w.print(
                     \\        pub const build_zig = @import({q});

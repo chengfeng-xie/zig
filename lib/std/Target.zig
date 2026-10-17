@@ -3481,34 +3481,18 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
-
-        .@"3ds" => switch (c_type) {
+        .gba, .@"3ds", .wiiu => switch (c_type) {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float, .long, .ulong => 32,
             .longlong, .ulonglong, .double, .longdouble => 64,
         },
-
-        .wiiu => switch (c_type) {
-            .char => 8,
-            .short, .ushort => 16,
-            .int, .uint, .float, .long, .ulong => 32,
-            .longlong, .ulonglong, .double, .longdouble => 64,
-        },
-
         .@"switch" => switch (c_type) {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float => 32,
             .long, .ulong, .longlong, .ulonglong, .double => 64,
             .longdouble => 128,
-        },
-
-        .gba => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .long, .ulong, .float => return 32,
-            .longlong, .ulonglong, .double, .longdouble => return 64,
         },
 
         .psx => switch (c_type) {
@@ -3532,6 +3516,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .long, .ulong => 64,
             .longlong, .ulonglong, .double, .longdouble => 64,
         },
+
         .tios => switch (c_type) {
             .char => 8,
             .short, .ushort => 16,

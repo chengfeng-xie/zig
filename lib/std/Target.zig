@@ -3150,6 +3150,7 @@ pub fn stackGrowth(target: *const Target) StackGrowth {
 /// Returns `null` if no C ABI is defined for this target.
 pub fn cCharSignedness(target: *const Target) ?std.builtin.Signedness {
     switch (target.os.tag) {
+        .ps3 => return .signed,
         .opengl => return null,
         else => {},
     }

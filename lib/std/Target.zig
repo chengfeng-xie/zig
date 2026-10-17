@@ -3254,30 +3254,6 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                 .long, .ulong, .float => 32,
                 .double, .longdouble, .longlong, .ulonglong => 64,
             },
-            .mips64,
-            .mips64el,
-            => switch (c_type) {
-                .char => 8,
-                .short, .ushort => 16,
-                .int, .uint, .float => 32,
-                .long, .ulong => switch (target.abi) {
-                    .abin32 => 32,
-                    else => 64,
-                },
-                .longlong, .ulonglong, .double => 64,
-                .longdouble => 128,
-            },
-            .x86_64 => switch (c_type) {
-                .char => 8,
-                .short, .ushort => 16,
-                .int, .uint, .float => 32,
-                .long, .ulong => switch (target.abi) {
-                    .x32 => 32,
-                    else => 64,
-                },
-                .longlong, .ulonglong, .double => 64,
-                .longdouble => 80,
-            },
             else => switch (c_type) {
                 .char => 8,
                 .short, .ushort => 16,
@@ -3285,7 +3261,11 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                 .long, .ulong => target.ptrBitWidth(),
                 .longlong, .ulonglong, .double => 64,
                 .longdouble => switch (target.cpu.arch) {
-                    .x86 => 80,
+                    else => 64,
+
+                    .x86,
+                    .x86_64,
+                    => 80,
 
                     .alpha,
                     .riscv32,
@@ -3294,6 +3274,8 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                     .riscv64be,
                     .aarch64,
                     .aarch64_be,
+                    .mips64,
+                    .mips64el,
                     .powerpc,
                     .powerpcle,
                     .powerpc64,
@@ -3307,8 +3289,6 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                     .loongarch64,
                     .ve,
                     => 128,
-
-                    else => 64,
                 },
             },
         },

@@ -3497,7 +3497,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .longdouble => 128,
         },
 
-        .psx, .ps3 => switch (c_type) {
+        .psx, .ps3, .psp, .vita => switch (c_type) {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .long, .ulong, .float => 32,
@@ -3507,16 +3507,8 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float => 32,
-            .long, .ulong => 64,
-            .longlong, .ulonglong, .double => 64,
+            .long, .ulong, .longlong, .ulonglong, .double => 64,
             .longdouble => 80,
-        },
-        .psp, .vita => switch (c_type) {
-            .char => 8,
-            .short, .ushort => 16,
-            .int, .uint, .float => 32,
-            .long, .ulong => 64,
-            .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
         .tios => switch (c_type) {

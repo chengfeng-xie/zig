@@ -2946,6 +2946,7 @@ pub const DynamicLinker = struct {
             .gba,
 
             .psx,
+            .ps3,
             .psp,
             .vita,
 
@@ -2967,7 +2968,6 @@ pub const DynamicLinker = struct {
 
             // TODO go over each item in this list and either move it to the above list, or
             // implement the standard dynamic linker path code for it.
-            .ps3,
             .ps4,
             .ps5,
             => none,

@@ -3473,37 +3473,14 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             },
         },
 
-        .nvcl, .cuda => switch (c_type) {
+        .cuda, .amdhsa, .amdpal, .mesa3d, .nvcl, .opencl, .vulkan => switch (c_type) {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float => 32,
-            .long, .ulong => switch (target.cpu.arch) {
-                .nvptx => 32,
-                .nvptx64 => 64,
-                else => 64,
-            },
-            .longlong, .ulonglong, .double => 64,
-            .longdouble => 64,
+            .long, .ulong => target.ptrBitWidth(),
+            .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
-        .amdhsa, .amdpal, .mesa3d => switch (c_type) {
-            .char => 8,
-            .short, .ushort => 16,
-            .int, .uint, .float => 32,
-            .long, .ulong, .longlong, .ulonglong, .double => 64,
-            .longdouble => 128,
-        },
-
-        .opencl, .vulkan => switch (c_type) {
-            .char => 8,
-            .short, .ushort => 16,
-            .int, .uint, .float => 32,
-            .long, .ulong, .double => 64,
-            .longlong, .ulonglong => 128,
-            // Note: The OpenCL specification does not guarantee a particular size for long double,
-            // but clang uses 128 bits.
-            .longdouble => 128,
-        },
 
         .@"3ds" => switch (c_type) {
             .char => 8,

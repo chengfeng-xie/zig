@@ -2485,6 +2485,9 @@ pub const DynamicLinker = struct {
             .tvos,
             .visionos,
             .watchos,
+
+            .ps4,
+            .ps5,
             => .arch_os,
 
             .hurd,
@@ -2508,6 +2511,11 @@ pub const DynamicLinker = struct {
             .@"switch",
             .gba,
 
+            .psx,
+            .ps3,
+            .psp,
+            .vita,
+
             .emscripten,
             .wasi,
 
@@ -2519,13 +2527,6 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
-
-            .psx,
-            .ps3,
-            .ps4,
-            .ps5,
-            .psp,
-            .vita,
 
             .tios,
             .ashetos,
@@ -2926,8 +2927,10 @@ pub const DynamicLinker = struct {
                 else => none,
             },
 
-            // Operating systems in this list have been verified as not having a standard
-            // dynamic linker path.
+            .ps4,
+            .ps5,
+            => if (cpu.arch == .x86_64) init("/libexec/ld-elf.so.1") else none,
+
             .freestanding,
             .other,
 
@@ -2964,12 +2967,6 @@ pub const DynamicLinker = struct {
 
             .tios,
             .ashetos,
-            => none,
-
-            // TODO go over each item in this list and either move it to the above list, or
-            // implement the standard dynamic linker path code for it.
-            .ps4,
-            .ps5,
             => none,
         } catch unreachable;
     }

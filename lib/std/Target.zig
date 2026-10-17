@@ -3315,6 +3315,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
 
         .fuchsia,
         .hermit,
+        .managarm,
 
         .haiku,
         .hurd,
@@ -3529,7 +3530,6 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
         .opengl => null,
 
         .contiki,
-        .managarm,
         => @panic("specify the C integer and float type sizes for this OS"),
     };
 }

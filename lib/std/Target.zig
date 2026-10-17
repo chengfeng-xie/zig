@@ -3152,7 +3152,7 @@ pub fn cCharSignedness(target: *const Target) ?std.builtin.Signedness {
     return switch (target.os.tag) {
         .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .signed,
         .windows, .uefi => .signed,
-        .ps3 => .signed,
+        .ps3, .vita => .signed,
         .opengl => null,
         else => switch (target.cpu.arch) {
             .aarch64,

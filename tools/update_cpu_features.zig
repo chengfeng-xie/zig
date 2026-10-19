@@ -499,7 +499,7 @@ const targets = [_]ArchTarget{
             },
             .{
                 .zig_name = "fix",
-                .desc = "Enable floating point move and square root extensions",
+                .desc = "Enable FPR-to-GPR move and square root extensions",
                 .deps = &.{},
             },
             .{

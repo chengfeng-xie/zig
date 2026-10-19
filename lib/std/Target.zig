@@ -3337,7 +3337,10 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float => 32,
-            .long, .ulong => target.ptrBitWidth(),
+            .long, .ulong => switch (target.os.tag) {
+                .plan9 => 32, // This is certainly A Choice.
+                else => target.ptrBitWidth(),
+            },
             .longlong, .ulonglong, .double => 64,
             .longdouble => switch (target.cpu.arch) {
                 .x86,

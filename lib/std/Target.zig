@@ -3371,7 +3371,13 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                     },
                 },
 
-                .alpha,
+                .alpha => switch (target.os.tag) {
+                    .netbsd,
+                    .openbsd,
+                    => 64,
+                    else => 128,
+                },
+
                 .riscv32,
                 .riscv32be,
                 .riscv64,

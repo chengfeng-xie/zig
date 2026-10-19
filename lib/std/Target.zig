@@ -3333,88 +3333,64 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
 
         .wasi,
         .emscripten,
-        => switch (target.cpu.arch) {
-            .mips64,
-            .mips64el,
-            => switch (c_type) {
-                .char => 8,
-                .short, .ushort => 16,
-                .int, .uint, .float => 32,
-                .long, .ulong => switch (target.abi) {
-                    .gnuabin32, .muslabin32, .abin32 => 32,
-                    else => 64,
+        => switch (c_type) {
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong => target.ptrBitWidth(),
+            .longlong, .ulonglong, .double => 64,
+            .longdouble => switch (target.cpu.arch) {
+                .x86,
+                .x86_64,
+                => switch (target.abi) {
+                    .android => 64,
+                    else => 80,
                 },
-                .longlong, .ulonglong, .double => 64,
-                .longdouble => 128,
-            },
-            .x86_64 => switch (c_type) {
-                .char => 8,
-                .short, .ushort => 16,
-                .int, .uint, .float => 32,
-                .long, .ulong => switch (target.abi) {
-                    .gnux32, .muslx32, .x32 => 32,
-                    else => 64,
+
+                .powerpc,
+                .powerpcle,
+                => switch (target.abi) {
+                    .musleabi, .musleabihf => 64,
+                    else => switch (target.os.tag) {
+                        .netbsd,
+                        .openbsd,
+                        => 64,
+                        else => 128,
+                    },
                 },
-                .longlong, .ulonglong, .double => 64,
-                .longdouble => 80,
-            },
-            else => switch (c_type) {
-                .char => 8,
-                .short, .ushort => 16,
-                .int, .uint, .float => 32,
-                .long, .ulong => target.ptrBitWidth(),
-                .longlong, .ulonglong, .double => 64,
-                .longdouble => switch (target.cpu.arch) {
-                    .x86 => switch (target.abi) {
-                        .android => 64,
-                        else => 80,
+
+                .powerpc64,
+                .powerpc64le,
+                => switch (target.abi) {
+                    .musl => 64,
+                    else => switch (target.os.tag) {
+                        .freebsd,
+                        .openbsd,
+                        => 64,
+                        else => 128,
                     },
-
-                    .powerpc,
-                    .powerpcle,
-                    => switch (target.abi) {
-                        .musleabi, .musleabihf => 64,
-                        else => switch (target.os.tag) {
-                            .netbsd,
-                            .openbsd,
-                            => 64,
-                            else => 128,
-                        },
-                    },
-
-                    .powerpc64,
-                    .powerpc64le,
-                    => switch (target.abi) {
-                        .musl => 64,
-                        else => switch (target.os.tag) {
-                            .freebsd,
-                            .openbsd,
-                            => 64,
-                            else => 128,
-                        },
-                    },
-
-                    .alpha,
-                    .riscv32,
-                    .riscv32be,
-                    .riscv64,
-                    .riscv64be,
-                    .aarch64,
-                    .aarch64_be,
-                    .s390x,
-                    .mips64,
-                    .mips64el,
-                    .sparc,
-                    .sparc64,
-                    .wasm32,
-                    .wasm64,
-                    .loongarch32,
-                    .loongarch64,
-                    .ve,
-                    => 128,
-
-                    else => 64,
                 },
+
+                .alpha,
+                .riscv32,
+                .riscv32be,
+                .riscv64,
+                .riscv64be,
+                .aarch64,
+                .aarch64_be,
+                .s390x,
+                .mips64,
+                .mips64el,
+                .sparc,
+                .sparc64,
+                .wasm32,
+                .wasm64,
+                .loongarch32,
+                .loongarch64,
+                .ve,
+                => 128,
+
+                else => 64,
             },
         },
 

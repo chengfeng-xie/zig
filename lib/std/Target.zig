@@ -3253,6 +3253,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
         .freestanding,
         .other,
         .ashetos,
+        .tios,
         => switch (target.cpu.arch) {
             .msp430,
             .x86_16,
@@ -3274,6 +3275,13 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                 .short, .ushort, .int, .uint => 16,
                 .long, .ulong, .float => 32,
                 .double, .longdouble, .longlong, .ulonglong => 64,
+            },
+            .ez80 => switch (c_type) {
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint => 24,
+                .long, .ulong, .float, .double => 32,
+                .longlong, .ulonglong, .longdouble => 64,
             },
             else => switch (c_type) {
                 .char => 8,
@@ -3495,14 +3503,6 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .int, .uint, .float => 32,
             .long, .ulong, .longlong, .ulonglong, .double => 64,
             .longdouble => 80,
-        },
-
-        .tios => switch (c_type) {
-            .char => 8,
-            .short, .ushort => 16,
-            .int, .uint => 24,
-            .long, .ulong, .float, .double => 32,
-            .longlong, .ulonglong, .longdouble => 64,
         },
 
         .opengl => null,

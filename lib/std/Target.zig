@@ -2616,6 +2616,16 @@ pub const DynamicLinker = struct {
 
                     else => none,
                 }
+            else if (abi.isOpenHarmony())
+                switch (cpu.arch) {
+                    .aarch64,
+                    .x86_64,
+                    => |arch| if (abi == .ohos) initFmt("/lib/ld-musl-{s}.so.1", .{@tagName(arch)}) else none,
+
+                    .arm => if (abi == .ohoseabi) init("/lib/ld-musl-arm.so.1") else none,
+
+                    else => none,
+                }
             else if (abi.isMusl())
                 switch (cpu.arch) {
                     .arm,

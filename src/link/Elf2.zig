@@ -8421,24 +8421,27 @@ fn prelinkInner(elf: *Elf) Error!void {
     if (comp.zcu) |_| self_hosted_codegen: {
         if (comp.config.use_llvm) break :self_hosted_codegen;
 
-        // We're using self-hosted codegen---add an input representing the Zig "object".
-        try elf.inputs.ensureUnusedCapacity(gpa, 1);
-        const zcu_name = try std.fmt.allocPrint(gpa, "{s}_zcu", .{comp.root_name});
-        defer gpa.free(zcu_name);
-        const zcu_file_symbol = try elf.addLocalSymbol(.{
-            .node = .none,
-            .name = zcu_name,
-            .value = 0,
-            .size = 0,
-            .type = .FILE,
-            .shndx = .ABS,
-        });
-        elf.inputs.addOneAssumeCapacity().* = .{
-            .path = elf.base.emit,
-            .member = null,
-            .extra = .{ .file_symbol = zcu_file_symbol },
-        };
-        elf.input_pending_index += 1;
+        if (elf.archive == null) {
+            // Self-hosted codegen is logically emitting a relocatable which is then immediately
+            // being linked into the output file, so add that fictional Zig object file input.
+            try elf.inputs.ensureUnusedCapacity(gpa, 1);
+            const zcu_name = try std.fmt.allocPrint(gpa, "{s}_zcu", .{comp.root_name});
+            defer gpa.free(zcu_name);
+            const zcu_file_symbol = try elf.addLocalSymbol(.{
+                .node = .none,
+                .name = zcu_name,
+                .value = 0,
+                .size = 0,
+                .type = .FILE,
+                .shndx = .ABS,
+            });
+            elf.inputs.addOneAssumeCapacity().* = .{
+                .path = elf.base.emit,
+                .member = null,
+                .extra = .{ .file_symbol = zcu_file_symbol },
+            };
+            elf.input_pending_index += 1;
+        }
 
         switch (elf.shndx.debug_addr) {
             .UNDEF => {},

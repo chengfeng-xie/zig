@@ -3343,7 +3343,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
                 .x86,
                 .x86_64,
                 => switch (target.abi) {
-                    .android => 64,
+                    .android, .ohos => 64,
                     else => 80,
                 },
 

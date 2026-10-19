@@ -176,7 +176,14 @@ debug_compile_errors: bool,
 /// Do not check this field directly. Instead, use the `debugIncremental` wrapper function.
 debug_incremental: bool,
 alloc_failure_occurred: bool = false,
-last_update_was_cache_hit: bool = false,
+
+last_update_cache_status: Cache.Manifest.CheckResult,
+/// Corresponds to .zig-cache/h/* filenames.
+/// Remains stable across updates.
+input_digest: [Cache.bin_digest_len]u8,
+/// Corresponds to .zig-cache/o/* filenames.
+/// May change across updates.
+discovered_digest: [Cache.bin_digest_len]u8,
 
 c_source_files: []const CSourceFile,
 rc_source_files: []const RcSourceFile,
@@ -250,12 +257,6 @@ link_prog_node: std.Progress.Node = .none,
 llvm_opt_bisect_limit: c_int,
 
 time_report: ?TimeReport,
-
-file_system_inputs: ?*std.ArrayList(u8),
-
-/// This is the digest of the cache for the current compilation.
-/// This digest will be known after update() is called.
-digest: ?[Cache.bin_digest_len]u8 = null,
 
 /// Non-`null` iff we are emitting a binary.
 /// Does not change for the lifetime of this `Compilation`.
@@ -1600,9 +1601,6 @@ pub const CreateOptions = struct {
     error_limit: ?Zcu.ErrorInt = null,
     global_cc_argv: []const []const u8 = &.{},
 
-    /// Tracks all files that can cause the Compilation to be invalidated and need a rebuild.
-    file_system_inputs: ?*std.ArrayList(u8) = null,
-
     parent_whole_cache: ?ParentWholeCache = null,
 
     environ_map: *const std.process.Environ.Map,
@@ -2147,7 +2145,6 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .force_undefined_symbols = options.force_undefined_symbols,
             .link_eh_frame_hdr = link_eh_frame_hdr,
             .global_cc_argv = options.global_cc_argv,
-            .file_system_inputs = options.file_system_inputs,
             .parent_whole_cache = options.parent_whole_cache,
             .link_diags = .init(gpa, io),
             .oneshot_prelink_tasks = .empty,
@@ -2158,6 +2155,11 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .emit_llvm_bc = try options.emit_llvm_bc.resolve(arena, &options, .llvm_bc),
             .emit_docs = try options.emit_docs.resolve(arena, &options, .docs),
             .environ_map = options.environ_map,
+
+            // These are populated during `update`.
+            .last_update_cache_status = undefined,
+            .input_digest = undefined,
+            .discovered_digest = undefined,
         };
 
         errdefer {
@@ -2300,7 +2302,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
                 // In the case of incremental cache mode, this `artifact_directory`
                 // is computed based on a hash of non-linker inputs, and it is where all
                 // build artifacts are stored (even while in-progress).
-                comp.digest = hash.peekBin();
+                comp.input_digest = hash.peekBin();
+                comp.computed_digest = comp.input_digest;
                 const digest = hash.final();
 
                 const artifact_sub_dir = "o" ++ fs.path.sep_str ++ digest;
@@ -2817,7 +2820,6 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             log.debug("{s} whole cache {f} ignore_hit={}", .{ comp.root_name, status.fmt(&man), ignore_hit });
             if (status == .hit and !ignore_hit) {
                 // In this case the cache hit contains the full set of file system inputs. Nice!
-                if (comp.file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
                 if (comp.parent_whole_cache) |pwc| {
                     try pwc.mutex.lock(io);
                     defer pwc.mutex.unlock(io);
@@ -2881,16 +2883,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
         try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_objects.items.len);
         for (comp.c_objects.items) |c_object| {
             comp.c_object_work_queue.pushBackAssumeCapacity(c_object);
-            try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{c_object.src.src_path}));
         }
-    }
-
-    for (comp.link_inputs) |input| {
-        const path = input.path();
-        try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{
-            path.root_dir.path orelse ".",
-            path.sub_path,
-        }));
     }
 
     // For compiling Win32 resources, we rely on the cache hash system to avoid duplicating work.
@@ -2898,23 +2891,12 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     try comp.win32_resource_work_queue.ensureUnusedCapacity(gpa, comp.win32_resources.items.len);
     for (comp.win32_resources.items) |win32_resource| {
         comp.win32_resource_work_queue.pushBackAssumeCapacity(win32_resource);
-        switch (win32_resource.src) {
-            .rc => |f| {
-                try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{f.src_path}));
-            },
-            .manifest => {},
-        }
     }
 
     if (comp.zcu) |zcu| {
         assert(zcu.cur_analysis_timer == null);
 
         zcu.skip_analysis_this_update = false;
-
-        // TODO: doing this in `resolveReferences` later could avoid adding inputs for dead embedfiles. Investigate!
-        for (zcu.embed_table.keys()) |embed_file| {
-            try comp.appendFileSystemInput(embed_file.path);
-        }
 
         zcu.analysis_roots_len = 0;
 
@@ -3003,7 +2985,6 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     }
 
     if (comp.link_depfile) |depfile_path| if (comp.bin_file) |lf| {
-        assert(comp.file_system_inputs != null);
         comp.createDepFile(depfile_path, lf.emit) catch |err|
             comp.setMiscFailure(.link_depfile, "writing linker dependency file failed: {t}", .{err});
     };
@@ -3024,7 +3005,6 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     switch (comp.cache_use) {
         .none, .incremental => try flush(comp, arena),
         .whole => |whole| {
-            if (comp.file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
             if (comp.parent_whole_cache) |pwc| {
                 try pwc.mutex.lock(io);
                 defer pwc.mutex.unlock(io);
@@ -3127,39 +3107,6 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             whole.lock = man.toOwnedLock();
         },
     }
-}
-
-/// Thread-safe. Assumes that `comp.mutex` is *not* already held by the caller.
-pub fn appendFileSystemInput(comp: *Compilation, path: Compilation.Path) Allocator.Error!void {
-    const gpa = comp.gpa;
-    const io = comp.io;
-    const fsi = comp.file_system_inputs orelse return;
-    const prefixes = comp.cache_parent.prefixes();
-
-    const want_prefix_dir: Cache.Directory = switch (path.root) {
-        .zig_lib => comp.dirs.zig_lib,
-        .global_cache => comp.dirs.global_cache,
-        .local_cache => comp.dirs.local_cache,
-        .build_root => comp.dirs.build_root,
-        .none => .cwd(),
-    };
-    const prefix: u8 = for (prefixes, 1..) |prefix_dir, i| {
-        if (prefix_dir.eql(want_prefix_dir)) {
-            break @intCast(i);
-        }
-    } else std.debug.panic(
-        "missing prefix directory {t} ('{f}') for {q}",
-        .{ path.root, want_prefix_dir, path.sub_path },
-    );
-
-    // There may be concurrent calls to this function from C object workers and/or the main thread.
-    comp.mutex.lockUncancelable(io);
-    defer comp.mutex.unlock(io);
-
-    try fsi.ensureUnusedCapacity(gpa, path.sub_path.len + 3);
-    if (fsi.items.len > 0) fsi.appendAssumeCapacity(0);
-    fsi.appendAssumeCapacity(prefix);
-    fsi.appendSliceAssumeCapacity(path.sub_path);
 }
 
 fn resolveEmitPath(comp: *Compilation, path: []const u8) Cache.Path {
@@ -4649,6 +4596,7 @@ fn writeDepFile(
     w: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
     const prefixes = comp.cache_parent.prefixes();
+    if (true) @panic("TODO reimplement this based on Cache.Manifest data");
     const fsi = comp.file_system_inputs.?.items;
 
     try w.print("{f}:", .{bin_file});
@@ -4667,11 +4615,8 @@ fn writeDepFile(
 }
 
 fn workerDocsCopy(comp: *Compilation) void {
-    docsCopyFallible(comp) catch |err| return comp.lockAndSetMiscFailure(
-        .docs_copy,
-        "unable to copy autodocs artifacts: {s}",
-        .{@errorName(err)},
-    );
+    docsCopyFallible(comp) catch |err|
+        return comp.lockAndSetMiscFailure(.docs_copy, "unable to copy autodocs artifacts: {t}", .{err});
 }
 
 fn docsCopyFallible(comp: *Compilation) anyerror!void {
@@ -4680,11 +4625,9 @@ fn docsCopyFallible(comp: *Compilation) anyerror!void {
 
     const docs_path = comp.resolveEmitPath(comp.emit_docs.?);
     var out_dir = docs_path.root_dir.handle.createDirPathOpen(io, docs_path.sub_path, .{}) catch |err| {
-        return comp.lockAndSetMiscFailure(
-            .docs_copy,
-            "unable to create output directory '{f}': {s}",
-            .{ docs_path, @errorName(err) },
-        );
+        return comp.lockAndSetMiscFailure(.docs_copy, "unable to create output directory {qf}: {t}", .{
+            docs_path, err,
+        });
     };
     defer out_dir.close(io);
 
@@ -4695,11 +4638,7 @@ fn docsCopyFallible(comp: *Compilation) anyerror!void {
     }
 
     var tar_file = out_dir.createFile(io, "sources.tar", .{}) catch |err| {
-        return comp.lockAndSetMiscFailure(
-            .docs_copy,
-            "unable to create '{f}/sources.tar': {s}",
-            .{ docs_path, @errorName(err) },
-        );
+        return comp.lockAndSetMiscFailure(.docs_copy, "unable to create '{f}/sources.tar': {t}", .{ docs_path, err });
     };
     defer tar_file.close(io);
 
@@ -5719,64 +5658,17 @@ fn updateCObject(
                 .sub_path = fs.path.basename(raw_dep_file_path),
             };
 
-            if (comp.file_system_inputs != null) {
-                // TODO instead of this rely on passing the manifest contents directly
-
-                // Use the same file size limit as the cache code does for dependency files.
-                const dep_file_contents = dep_file_path.root_dir.handle.readFileAlloc(io, dep_file_path.sub_path, gpa, .unlimited) catch |err| switch (err) {
-                    error.OutOfMemory, error.Canceled => |e| return e,
-                    else => |e| return comp.failCObjRetryable(
-                        c_object,
-                        "failed to read '{f}': {t}",
-                        .{ dep_file_path, e },
-                    ),
-                };
-                defer gpa.free(dep_file_contents);
-
-                var str_buf: std.ArrayList(u8) = .empty;
-                defer str_buf.deinit(gpa);
-
-                var it: std.Build.Cache.DepTokenizer = .{ .bytes = dep_file_contents };
-                while (it.next()) |token| {
-                    const input_path: Compilation.Path = switch (token) {
-                        .target, .target_must_resolve => continue,
-                        .prereq => |file_path| try .fromUnresolved(arena, comp.dirs, &.{file_path}),
-                        .prereq_must_resolve => p: {
-                            try token.resolve(gpa, &str_buf);
-                            break :p try .fromUnresolved(arena, comp.dirs, &.{str_buf.items});
-                        },
-                        else => |err_token| return comp.failCObjRetryable(
-                            c_object,
-                            "failed parsing '{f}': {f}",
-                            .{ dep_file_path, err_token },
-                        ),
-                    };
-                    try comp.appendFileSystemInput(input_path);
-                }
-            }
-
             // Add the files depended on to the cache system.
             var diags: Cache.Manifest.AddDiscoveredDepFileDiagnostic = undefined;
             man.addDiscoveredDepFile(dep_file_path, &diags) catch |err| switch (err) {
-                error.OutOfMemory,
-                error.Canceled,
-                => |e| return e,
-
-                error.InvalidDepFile => return comp.failCObjRetryable(
-                    c_object,
-                    "failed to parse '{f}': {f}",
-                    .{ dep_file_path, diags.dep_tokenizer },
-                ),
-                error.FileSystemFailure => return comp.failCObjRetryable(
-                    c_object,
-                    "failed to parse '{f}': {f}",
-                    .{ dep_file_path, diags.add_discovered_path },
-                ),
-                else => |e| return comp.failCObjRetryable(
-                    c_object,
-                    "failed to read '{f}': {t}",
-                    .{ dep_file_path, e },
-                ),
+                error.OutOfMemory, error.Canceled => |e| return e,
+                error.InvalidDepFile => return comp.failCObjRetryable(c_object, "failed to parse {qf}: {f}", .{
+                    dep_file_path, diags.dep_tokenizer,
+                }),
+                error.FileSystemFailure => return comp.failCObjRetryable(c_object, "failed to parse {qf}: {f}", .{
+                    dep_file_path, diags.add_discovered_path,
+                }),
+                else => |e| return comp.failCObjRetryable(c_object, "failed to read {qf}: {t}", .{ dep_file_path, e }),
             };
             switch (comp.cache_use) {
                 .whole => |whole| {
@@ -5784,25 +5676,17 @@ fn updateCObject(
                         try whole.cache_manifest_mutex.lock(io);
                         defer whole.cache_manifest_mutex.unlock(io);
                         whole_cache_manifest.addDiscoveredDepFile(dep_file_path, &diags) catch |err| switch (err) {
-                            error.OutOfMemory,
-                            error.Canceled,
-                            => |e| return e,
+                            error.OutOfMemory, error.Canceled => |e| return e,
 
-                            error.InvalidDepFile => return comp.failCObjRetryable(
-                                c_object,
-                                "failed to parse '{f}': {f}",
-                                .{ dep_file_path, diags.dep_tokenizer },
-                            ),
-                            error.FileSystemFailure => return comp.failCObjRetryable(
-                                c_object,
-                                "failed to parse '{f}': {f}",
-                                .{ dep_file_path, diags.add_discovered_path },
-                            ),
-                            else => |e| return comp.failCObjRetryable(
-                                c_object,
-                                "failed to read '{f}': {t}",
-                                .{ dep_file_path, e },
-                            ),
+                            error.InvalidDepFile => return comp.failCObjRetryable(c_object, "failed to parse {qf}: {f}", .{
+                                dep_file_path, diags.dep_tokenizer,
+                            }),
+                            error.FileSystemFailure => return comp.failCObjRetryable(c_object, "failed to parse {qf}: {f}", .{
+                                dep_file_path, diags.add_discovered_path,
+                            }),
+                            else => |e| return comp.failCObjRetryable(c_object, "failed to read {qf}: {t}", .{
+                                dep_file_path, e,
+                            }),
                         };
                     }
                 },

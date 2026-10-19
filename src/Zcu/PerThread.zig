@@ -2643,8 +2643,6 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
             .success => {},
         }
 
-        try comp.appendFileSystemInput(file.path);
-
         switch (file.getMode()) {
             .zig => {}, // continue to logic below
             .zon => continue, // ZON can't import anything
@@ -3019,8 +3017,6 @@ fn newEmbedFile(pt: Zcu.PerThread, path: Compilation.Path) EmbedFileError!*Zcu.E
 
     var opt_ip_str: ?InternPool.String = null;
     try pt.updateEmbedFile(new_file, &opt_ip_str);
-
-    try comp.appendFileSystemInput(path);
 
     // Add the file contents to the `whole` cache manifest if necessary.
     cache: {

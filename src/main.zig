@@ -3627,9 +3627,6 @@ fn buildOutputType(
         break :b .whole;
     };
 
-    var file_system_inputs: std.ArrayList(u8) = .empty;
-    defer file_system_inputs.deinit(gpa);
-
     // Deduplicate rpath entries
     var rpath_dedup = std.array_hash_map.String(void){};
     for (create_module.rpath_list.items) |rpath| {
@@ -3762,7 +3759,6 @@ fn buildOutputType(
         // than to any particular module. This feature can greatly reduce CLI
         // noise when --search-prefix and -M are combined.
         .global_cc_argv = try cc_argv.toOwnedSlice(arena),
-        .file_system_inputs = &file_system_inputs,
         .debug_compiler_runtime_libs = debug_compiler_runtime_libs,
         .environ_map = environ_map,
     }) catch |err| switch (err) {
@@ -3818,7 +3814,6 @@ fn buildOutputType(
                 arg_mode,
                 all_args,
                 runtime_args_start,
-                environ_map,
             );
             return cleanExit(io);
         },
@@ -3845,7 +3840,6 @@ fn buildOutputType(
                 arg_mode,
                 all_args,
                 runtime_args_start,
-                environ_map,
             );
             return cleanExit(io);
         },
@@ -3858,7 +3852,7 @@ fn buildOutputType(
         defer root_prog_node.end();
 
         if (arg_mode == .translate_c) {
-            return cmdTranslateC(comp, arena, null, null, root_prog_node, environ_map);
+            return cmdTranslateC(comp, arena, null, root_prog_node, environ_map);
         }
 
         updateModule(comp, color, root_prog_node) catch |err| switch (err) {
@@ -4400,7 +4394,6 @@ fn serve(
     arg_mode: ArgMode,
     all_args: []const []const u8,
     runtime_args_start: ?usize,
-    environ_map: *process.Environ.Map,
 ) !void {
     const gpa = comp.gpa;
     const io = comp.io;
@@ -4421,8 +4414,6 @@ fn serve(
 
     const main_progress_node = std.Progress.start(io, .{});
     defer main_progress_node.end();
-
-    const file_system_inputs = comp.file_system_inputs.?;
 
     const IncrementalDebugServer = if (build_options.enable_debug_extensions and !builtin.single_threaded)
         @import("IncrementalDebugServer.zig")
@@ -4446,29 +4437,8 @@ fn serve(
         switch (hdr.tag) {
             .exit => return cleanExit(io),
             .update => {
-                file_system_inputs.clearRetainingCapacity();
-
                 if (arg_mode == .translate_c) {
-                    var arena_instance = std.heap.ArenaAllocator.init(gpa);
-                    defer arena_instance.deinit();
-                    const arena = arena_instance.allocator();
-                    var output: Compilation.TranslateCResult = undefined;
-                    try cmdTranslateC(comp, arena, &output, file_system_inputs, main_progress_node, environ_map);
-                    defer output.deinit(gpa);
-
-                    if (file_system_inputs.items.len != 0) {
-                        try server.serveStringMessage(.file_system_inputs, file_system_inputs.items);
-                    }
-
-                    if (output.errors.errorMessageCount() != 0) {
-                        try server.serveErrorBundle(.error_bundle, output.errors);
-                    } else {
-                        try server.serveEmitDigest(&output.digest, .{
-                            .flags = .{ .cache_hit = output.cache_hit },
-                        });
-                    }
-
-                    continue;
+                    @panic("TODO delete translate-c");
                 }
 
                 try comp.makeBinFileWritable();
@@ -4496,7 +4466,6 @@ fn serve(
                 //);
             },
             .hot_update => {
-                file_system_inputs.clearRetainingCapacity();
                 if (child_pid) |pid| {
                     try comp.hotCodeSwap(main_progress_node, pid);
                     try serveUpdateResults(&server, comp);
@@ -4529,14 +4498,6 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
 
     var error_bundle = try comp.getAllErrorsAlloc();
     defer error_bundle.deinit(gpa);
-
-    if (comp.file_system_inputs) |file_system_inputs| {
-        if (file_system_inputs.items.len == 0) {
-            assert(error_bundle.errorMessageCount() > 0);
-        } else {
-            try s.serveStringMessage(.file_system_inputs, file_system_inputs.items);
-        }
-    }
 
     if (comp.time_report) |*tr| {
         var decls_len: u32 = 0;
@@ -4613,22 +4574,25 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
             },
         });
         try s.out.writeVecAll(&slices);
-        try s.out.flush();
     }
 
-    if (error_bundle.errorMessageCount() > 0) {
-        try s.serveErrorBundle(.error_bundle, error_bundle);
-        return;
-    }
+    try s.serveCacheManifestUnflushed(.{
+        .cache_status = switch (comp.last_update_cache_status) {
+            .hit => .{ .result = .hit, .file_off = 0 },
+            .incomplete_manifest => .{ .result = .incomplete_manifest, .file_off = 0 },
+            .invalid_manifest => .{ .result = .invalid_manifest, .file_off = 0 },
+            .path_deleted => |off| .{ .result = .path_deleted, .file_off = off },
+            .directory_status_changed => |off| .{ .result = .directory_status_changed, .file_off = off },
+            .metadata_changed => |off| .{ .result = .metadata_changed, .file_off = off },
+            .contents_changed => |off| .{ .result = .contents_changed, .file_off = off },
+        },
+        .input_hash = comp.input_hash,
+        .discovered_hash = comp.discovered_hash,
+    });
 
-    if (comp.digest) |digest| {
-        try s.serveEmitDigest(&digest, .{
-            .flags = .{ .cache_hit = comp.last_update_was_cache_hit },
-        });
-    }
-
-    // Serve empty error bundle to indicate the update is done.
-    try s.serveErrorBundle(.error_bundle, std.zig.ErrorBundle.empty);
+    // Even if error bundle is empty, serve it to indicate the update is done.
+    try s.serveErrorBundleUnflushed(.error_bundle, error_bundle);
+    try s.out.flush();
 }
 
 fn runOrTest(
@@ -4889,7 +4853,6 @@ fn cmdTranslateC(
     comp: *Compilation,
     arena: Allocator,
     fancy_output: ?*Compilation.TranslateCResult,
-    file_system_inputs: ?*std.ArrayList(u8),
     prog_node: std.Progress.Node,
     environ_map: *process.Environ.Map,
 ) !void {
@@ -4934,7 +4897,6 @@ fn cmdTranslateC(
 
         if (result.errors.errorMessageCount() != 0) {
             if (fancy_output) |p| {
-                if (file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
                 p.* = result;
                 return;
             } else {
@@ -4948,7 +4910,6 @@ fn cmdTranslateC(
         break :result result;
     };
 
-    if (file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
     if (fancy_output) |p| {
         p.* = result;
     } else {

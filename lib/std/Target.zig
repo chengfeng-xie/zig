@@ -3189,6 +3189,7 @@ pub fn cCharSignedness(target: *const Target) ?std.builtin.Signedness {
             .powerpcle,
             .powerpc64,
             .powerpc64le,
+            .propeller,
             .s390x,
             .riscv32,
             .riscv32be,

@@ -3087,14 +3087,17 @@ pub fn ptrBitWidth(target: *const Target) u16 {
 pub fn stackAlignment(target: *const Target) u16 {
     // Overrides for when the stack alignment is not equal to the pointer width.
     switch (target.cpu.arch) {
-        .ez80 => return 1,
+        .avr,
+        .ez80,
+        => return 1,
 
-        .m68k => return 2,
+        .m68k => if (target.os.tag != .netbsd) return 2,
 
         .amdgcn => return 4,
 
         .arm,
         .armeb,
+        .hexagon,
         .hppa,
         .lanai,
         .mips,
@@ -3112,20 +3115,21 @@ pub fn stackAlignment(target: *const Target) u16 {
         .hppa64,
         .loongarch32,
         .loongarch64,
+        .m88k,
         .mips64,
         .mips64el,
+        .powerpc,
+        .powerpcle,
+        .powerpc64,
+        .powerpc64le,
         .sparc64,
         .ve,
         .wasm32,
         .wasm64,
         .x86_64,
+        .xtensa,
+        .xtensaeb,
         => return 16,
-
-        // Some of the following prongs should really be testing the ABI, but our current `Abi` enum
-        // can't handle that level of nuance yet.
-        .powerpc64,
-        .powerpc64le,
-        => if (target.os.tag == .linux) return 16,
 
         .riscv32,
         .riscv32be,
@@ -3133,7 +3137,12 @@ pub fn stackAlignment(target: *const Target) u16 {
         .riscv64be,
         => if (!target.cpu.has(.riscv, .e)) return 16,
 
-        .x86 => if (target.os.tag != .windows and target.os.tag != .uefi) return 16,
+        .x86 => switch (target.os.tag) {
+            .hurd,
+            .linux,
+            => return 16,
+            else => {},
+        },
 
         .kvx => return 32,
 

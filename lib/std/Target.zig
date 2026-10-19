@@ -3773,7 +3773,10 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .lanai => .{ .lanai_sysv = .{} },
         .loongarch64 => .{ .loongarch64_lp64 = .{} },
         .loongarch32 => .{ .loongarch32_ilp32 = .{} },
-        .m68k => .{ .m68k_gnu = .{} },
+        .m68k => switch (target.os.tag) {
+            .netbsd => .{ .m68k_sysv = .{} },
+            else => .{ .m68k_gnu = .{} },
+        },
         .m88k => .{ .m88k_sysv = .{} },
         .microblaze, .microblazeel => .{ .microblaze_std = .{} },
         .msp430 => .{ .msp430_eabi = .{} },

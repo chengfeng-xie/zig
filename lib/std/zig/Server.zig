@@ -33,8 +33,6 @@ pub const Message = struct {
         zig_version,
         /// Body is an ErrorBundle.
         error_bundle,
-        /// Body is a EmitDigest.
-        emit_digest,
         /// Body is a TestMetadata
         test_metadata,
         /// Body is a TestResults
@@ -45,14 +43,9 @@ pub const Message = struct {
         /// runner to enforce unit test time limits is relatively accurate under extreme system load
         /// (where there may be a non-trivial delay before the test process is scheduled).
         test_started,
-        /// Body is a series of strings, delimited by null bytes.
-        /// Each string is a prefixed file path.
-        /// The first byte indicates the file prefix path (see prefixes fields
-        /// of Cache). This byte is sent over the wire incremented so that null
-        /// bytes are not confused with string terminators.
-        /// The remaining bytes is the file path relative to that prefix.
-        /// The prefixes are hard-coded in Compilation.create (cwd, zig lib dir, local cache dir)
-        file_system_inputs,
+        /// All the information needed to place a file watch on file system inputs. Same memory layout as
+        /// `std.Build.Cache.Manifest.contents`. Body is a `CacheManifest`.
+        cache_manifest,
         /// Body is:
         /// - a u64le that indicates the file path within the cache used
         ///   to store coverage information. The integer is a hash of the PCs
@@ -208,14 +201,33 @@ pub const Message = struct {
         };
     };
 
-    /// Trailing:
-    /// * the hex digest of the cache directory within the /o/ subdirectory.
-    pub const EmitDigest = extern struct {
-        flags: Flags,
+    pub const CacheManifest = extern struct {
+        /// Hit or miss, and if miss, what kind of miss, and which file or directory caused it.
+        cache_status: CacheStatus,
+        /// Binary digest of the cache inputs. Tells where to locate the manifest file.
+        input_hash: std.Build.Cache.BinDigest,
+        /// Binary digest of hashed input_hash plus each file's hash. Tells where to locate the cached
+        /// artifacts. This is technically denormalized data assuming the cache manifest file is intact.
+        discovered_hash: std.Build.Cache.BinDigest,
 
-        pub const Flags = packed struct(u8) {
-            cache_hit: bool,
-            reserved: u7 = 0,
+        pub const CacheStatus = packed struct(u32) {
+            result: Result,
+            /// Presence determined by cache_status.
+            file_off: u29,
+
+            pub const Result = enum(u3) {
+                hit,
+                incomplete_manifest,
+                invalid_manifest,
+                /// Has file_off
+                path_deleted,
+                /// Has file_off
+                directory_status_changed,
+                /// Has file_off
+                metadata_changed,
+                /// Has file_off
+                contents_changed,
+            };
         };
     };
 
@@ -317,30 +329,24 @@ pub fn serveBroadcastFuzzInputMessage(s: *const Server, test_i: u32, bytes: []co
     try s.out.flush();
 }
 
-pub fn serveEmitDigest(
-    s: *Server,
-    digest: *const [Cache.bin_digest_len]u8,
-    header: OutMessage.EmitDigest,
-) !void {
+pub fn serveCacheManifestUnflushed(s: *Server, header: OutMessage.CacheManifest) !void {
     try s.serveMessageHeader(.{
-        .tag = .emit_digest,
-        .bytes_len = @intCast(digest.len + @sizeOf(OutMessage.EmitDigest)),
+        .tag = .cache_manifest,
+        .bytes_len = @sizeOf(OutMessage.CacheManifest),
     });
     try s.out.writeStruct(header, .little);
-    try s.out.writeAll(digest);
-    try s.out.flush();
 }
 
 pub fn serveTestResults(s: *Server, msg: OutMessage.TestResults) !void {
     try s.serveMessageHeader(.{
         .tag = .test_results,
-        .bytes_len = @intCast(@sizeOf(OutMessage.TestResults)),
+        .bytes_len = @sizeOf(OutMessage.TestResults),
     });
     try s.out.writeStruct(msg, .little);
     try s.out.flush();
 }
 
-pub fn serveErrorBundle(s: *Server, tag: Message.Tag, error_bundle: std.zig.ErrorBundle) !void {
+pub fn serveErrorBundleUnflushed(s: *Server, tag: Message.Tag, error_bundle: std.zig.ErrorBundle) !void {
     const eb_hdr: OutMessage.ErrorBundle = .{
         .extra_len = @intCast(error_bundle.extra.len),
         .string_bytes_len = @intCast(error_bundle.string_bytes.len),
@@ -354,6 +360,10 @@ pub fn serveErrorBundle(s: *Server, tag: Message.Tag, error_bundle: std.zig.Erro
     try s.out.writeStruct(eb_hdr, .little);
     try s.out.writeSliceEndian(u32, error_bundle.extra, .little);
     try s.out.writeAll(error_bundle.string_bytes);
+}
+
+pub fn serveErrorBundle(s: *Server, tag: Message.Tag, error_bundle: std.zig.ErrorBundle) !void {
+    try serveErrorBundleUnflushed(s, tag, error_bundle);
     try s.out.flush();
 }
 

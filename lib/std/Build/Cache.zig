@@ -286,7 +286,7 @@ pub const Manifest = struct {
     want_refresh_timestamp: bool = true,
     /// Uses `Cache.gpa`.
     files: Files = .empty,
-    /// Indexes line up with `files`, but only up until `hit` is called. Uses
+    /// Indexes line up with `files`, but only up until `check` is called. Uses
     /// `Cache.gpa`.
     input_paths: std.ArrayList(InputPath) = .empty,
     /// Keeps track of the last time we performed a file system write to observe
@@ -915,7 +915,57 @@ pub const Manifest = struct {
 
         var input_digest: BinDigest = undefined;
         man.hash.hasher.final(&input_digest);
-        const input_hex_digest = binToHex(input_digest);
+
+        try openFile(man, &input_digest, diag);
+
+        man.want_refresh_timestamp = true;
+
+        // We're going to construct a second hash. Its input will begin with the digest we've already computed
+        // (`input_digest`), and then it'll have the digests of each input file, including discovered files (see
+        // `addDiscoveredPath`). If this is a hit, we learn the set of discovered files from the manifest on disk. If
+        // this is a miss, we'll learn those from future calls to `addDiscoveredPath` etc. As such, the state of
+        // `man.hash.hasher` after this function depends on whether this is a hit or a miss.
+        //
+        // If we return `CheckResult.hit`, then `man.hash.hasher` must already include the digests of the discovered
+        // files, so the caller can call `final`. Otherwise, on a cache miss, `man.hash.hasher` will include the digests
+        // of all non-discovered files -- that is, the ones we've already been told about. The rest will be discovered
+        // through calls to `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user
+        // can use `final`, and will at some point `finalize` the file list to disk.
+        man.hash.hasher = hasher_init;
+        man.hash.hasher.update(&input_digest);
+
+        hit: {
+            const miss_result = miss: {
+                const result = try man.checkLocked(diag);
+                if (result == .hit) {
+                    break :hit;
+                } else if (!try man.upgradeToExclusiveLock(diag)) {
+                    break :miss result;
+                }
+                // Missed with the shared lock, and upgraded to an exclusive lock. However, another process may have
+                // modified the cache directory, so we need to check again before deciding to miss.
+                man.shrinkFilesToInput();
+                const refreshed_result = try man.checkLocked(diag);
+                if (refreshed_result == .hit) break :hit;
+                break :miss refreshed_result;
+            };
+
+            // Cache miss, but `checkLocked` guarantees that all input files have their digests computed, even on a
+            // cache miss, which is needed because they will be used in the manifest digest.
+            man.state = .miss;
+            return miss_result;
+        }
+
+        if (man.want_shared_lock) {
+            man.downgradeToSharedLock() catch |err| return fail(diag, .{ .manifest_lock = err });
+        }
+
+        man.state = .hit;
+        return .hit;
+    }
+
+    pub fn openFile(man: *Manifest, input_digest: *const BinDigest, diag: *CheckDiagnostic) CheckError!void {
+        const input_hex_digest = binToHex(input_digest.*);
 
         const manifest_file_path = &input_hex_digest;
         const io = man.cache.io;
@@ -974,51 +1024,6 @@ pub const Manifest = struct {
                 else => |e| return fail(diag, .{ .manifest_create = e }),
             }
         }
-
-        man.want_refresh_timestamp = true;
-
-        // We're going to construct a second hash. Its input will begin with the digest we've already computed
-        // (`input_digest`), and then it'll have the digests of each input file, including discovered files (see
-        // `addDiscoveredPath`). If this is a hit, we learn the set of discovered files from the manifest on disk. If
-        // this is a miss, we'll learn those from future calls to `addDiscoveredPath` etc. As such, the state of
-        // `man.hash.hasher` after this function depends on whether this is a hit or a miss.
-        //
-        // If we return `CheckResult.hit`, then `man.hash.hasher` must already include the digests of the discovered
-        // files, so the caller can call `final`. Otherwise, on a cache miss, `man.hash.hasher` will include the digests
-        // of all non-discovered files -- that is, the ones we've already been told about. The rest will be discovered
-        // through calls to `addDiscoveredPath` etc, which will update the hasher. After all files are added, the user
-        // can use `final`, and will at some point `finalize` the file list to disk.
-        man.hash.hasher = hasher_init;
-        man.hash.hasher.update(&input_digest);
-
-        hit: {
-            const miss_result = miss: {
-                const result = try man.checkLocked(diag);
-                if (result == .hit) {
-                    break :hit;
-                } else if (!try man.upgradeToExclusiveLock(diag)) {
-                    break :miss result;
-                }
-                // Missed with the shared lock, and upgraded to an exclusive lock. However, another process may have
-                // modified the cache directory, so we need to check again before deciding to miss.
-                man.shrinkFilesToInput();
-                const refreshed_result = try man.checkLocked(diag);
-                if (refreshed_result == .hit) break :hit;
-                break :miss refreshed_result;
-            };
-
-            // Cache miss, but `checkLocked` guarantees that all input files have their digests computed, even on a
-            // cache miss, which is needed because they will be used in the manifest digest.
-            man.state = .miss;
-            return miss_result;
-        }
-
-        if (man.want_shared_lock) {
-            man.downgradeToSharedLock() catch |err| return fail(diag, .{ .manifest_lock = err });
-        }
-
-        man.state = .hit;
-        return .hit;
     }
 
     fn transitionToMissDiscovered(m: *Manifest) void {
@@ -1687,7 +1692,7 @@ pub const Manifest = struct {
         if (timestamp.nanoseconds < man.recent_problematic_timestamp.nanoseconds)
             return false;
 
-        // This flag prevents multiple filesystem writes for the same hit() call.
+        // This flag prevents multiple filesystem writes for the same `check` call.
         if (man.want_refresh_timestamp) {
             man.want_refresh_timestamp = false;
 
@@ -2156,7 +2161,7 @@ pub const Manifest = struct {
     }
 
     /// Releases the manifest file and frees any memory the Manifest was using.
-    /// `Manifest.hit` must be called first.
+    /// `Manifest.check` must be called first.
     ///
     /// Don't forget to call `finalize` before this!
     pub fn deinit(m: *Manifest) void {
@@ -2176,25 +2181,6 @@ pub const Manifest = struct {
         m.input_paths.deinit(gpa);
         m.all_input_content.deinit(gpa);
         m.* = undefined;
-    }
-
-    pub fn populateFileSystemInputs(man: *const Manifest, buf: *std.ArrayList(u8)) Allocator.Error!void {
-        assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".field_names.len == man.cache.prefixes_len);
-        buf.clearRetainingCapacity();
-        const gpa = man.cache.gpa;
-        const files = man.files.keys();
-        if (files.len > 0) {
-            const contents = man.contents.items;
-            for (files) |file| {
-                const file_path = file.path(contents);
-                try buf.ensureUnusedCapacity(gpa, file_path.len + 2);
-                buf.appendAssumeCapacity(@as(u8, file.get(contents).flags.prefix) + 1);
-                buf.appendSliceAssumeCapacity(file_path);
-                buf.appendAssumeCapacity(0);
-            }
-            // The null byte is a separator, not a terminator.
-            buf.items.len -= 1;
-        }
     }
 
     /// Add the full set of paths from another `Manifest` as a dependency of process being cached, after cache miss

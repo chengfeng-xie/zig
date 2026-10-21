@@ -1606,6 +1606,7 @@ fn configure(graph: *Graph, options: ConfigureOptions) ConfigureError!ScannedCon
             const configure_exe_path: Path = if (std.zig.buildExeSubprocess(gpa, io, .{
                 .argv = build_configurer_argv.items,
                 .cache_root = graph.local_cache_root,
+                .cache = &graph.cache,
                 .root_name = configurer_exe_name,
                 .environ_map = &graph.environ_map,
                 .cache_manifest = config_man,

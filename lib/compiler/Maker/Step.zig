@@ -660,68 +660,33 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
                 // This message indicates the end of the update.
                 if (watch) break;
             },
-            .emit_digest => {
-                const emit_digest = body_r.takeStruct(std.zig.Server.Message.EmitDigest, .little) catch unreachable;
-                const digest = body_r.takeArray(Cache.bin_digest_len) catch unreachable;
-                s.result_cache_status = if (emit_digest.flags.cache_hit) .hit else .incomplete_manifest;
-                result = .{ .bin = digest.* };
-            },
-            .file_system_inputs => {
-                clearWatchInputs(s, maker);
-                const conf = &maker.scanned_config.configuration;
-                const conf_step = step_index.ptr(conf);
-                var it = std.mem.splitScalar(u8, body, 0);
-                while (it.next()) |prefixed_path| {
-                    const prefix_index: std.zig.Server.Message.PathPrefix = @fromBackingInt(@intCast(prefixed_path[0] - 1));
-                    const sub_path = try arena.dupe(u8, prefixed_path[1..]);
-                    const sub_path_dirname = Dir.path.dirname(sub_path) orelse "";
-                    switch (prefix_index) {
-                        .cwd => {
-                            const path: Path = .{
-                                .root_dir = .cwd(),
-                                .sub_path = sub_path_dirname,
-                            };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
-                        },
-                        .zig_lib => zl: {
-                            switch (conf_step.extended.get(conf.extra)) {
-                                .compile => |compile| if (compile.zig_lib_dir.value) |zig_lib_dir| {
-                                    const resolved = try maker.resolveLazyPathIndex(arena, zig_lib_dir, step_index);
-                                    const appended = try resolved.join(arena, sub_path);
-                                    try addWatchInputPath(s, maker, appended);
-                                    break :zl;
-                                },
-                                else => {},
-                            }
-                            const path: Path = .{
-                                .root_dir = graph.zig_lib_directory,
-                                .sub_path = sub_path_dirname,
-                            };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
-                        },
-                        .local_cache => {
-                            const path: Path = .{
-                                .root_dir = graph.local_cache_root,
-                                .sub_path = sub_path_dirname,
-                            };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
-                        },
-                        .global_cache => {
-                            const path: Path = .{
-                                .root_dir = graph.global_cache_root,
-                                .sub_path = sub_path_dirname,
-                            };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
-                        },
-                        .build_root => {
-                            const path: Path = .{
-                                .root_dir = graph.build_root_directory,
-                                .sub_path = sub_path_dirname,
-                            };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
-                        },
-                    }
-                }
+            .cache_manifest => {
+                const cache_manifest = body_r.takeStruct(std.zig.Server.Message.CacheManifest, .little) catch unreachable;
+                var diag: Cache.Manifest.CheckDiagnostic = undefined;
+                var man = graph.cache.obtain();
+                defer man.deinit();
+                man.openFile(&cache_manifest.input_hash, &diag) catch |err| switch (err) {
+                    else => |e| return e,
+                    error.CacheCheckFailed => return s.fail(maker, "opening cache manifest failed: {f}", .{
+                        diag.fmt(&man),
+                    }),
+                };
+
+                s.result_cache_status = switch (cache_manifest.cache_status.result) {
+                    .hit => .hit,
+                    .incomplete_manifest => .incomplete_manifest,
+                    .invalid_manifest => .invalid_manifest,
+                    inline .path_deleted, .directory_status_changed, .metadata_changed, .contents_changed => |tag| b: {
+                        const off: Cache.Manifest.File.Offset = @fromBackingInt(cache_manifest.cache_status.file_off);
+                        break :b @unionInit(
+                            ResultCacheStatus,
+                            @tagName(tag),
+                            try gpa.dupeSentinel(u8, off.path(man.contents.items), 0),
+                        );
+                    },
+                };
+                result = .{ .bin = cache_manifest.discovered_hash };
+                try setWatchInputsFromManifest(s, maker, &man);
             },
             .time_report => if (maker.web_server) |ws| {
                 const tr = body_r.takeStruct(std.zig.Server.Message.TimeReport, .little) catch unreachable;

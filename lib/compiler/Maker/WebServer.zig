@@ -650,15 +650,37 @@ fn buildClientWasm(ws: *WebServer, arena: Allocator, optimize: std.builtin.Optim
     const compile_prog_node = ws.root_prog_node.start("Compile WebAssembly Component", 0);
     defer compile_prog_node.end();
 
+    var cache: Cache = .{
+        .gpa = gpa,
+        .io = io,
+        .manifest_dir = try graph.global_cache_root.handle.createDirPathOpen(io, "h", .{}),
+        .cwd = graph.cache.cwd,
+    };
+    defer cache.manifest_dir.close(io);
+    cache.addPrefix(.cwd());
+    cache.addPrefix(graph.zig_lib_directory);
+    cache.addPrefix(graph.global_cache_root);
+
     const result = try std.zig.buildExeSubprocess(gpa, io, .{
         .argv = argv.items,
         .cache_root = graph.global_cache_root,
+        .cache = &cache,
+        .prefix_map = .{
+            0, // cwd is the same
+            1, // zig lib dir is the same
+            2, // local cache is mapped to global cache
+            2, // global cache is the same
+            0, // build root is not provided
+        },
         .root_name = root_name,
         .arch_os_abi = arch_os_abi,
         .cpu_features = cpu_features,
         .progress_node = compile_prog_node,
     });
-    if (!result.cache_hit) log.info("source changes detected; rebuilt wasm component", .{});
+    switch (result.cache_result) {
+        .hit => {},
+        else => log.info("source changes detected: {t}; rebuilt wasm component", .{result.cache_result}),
+    }
     return result.path;
 }
 

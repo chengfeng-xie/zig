@@ -1828,10 +1828,12 @@ pub fn isUpDir(p: []const u8) bool {
 pub const BuildExeSubprocessOptions = struct {
     argv: []const []const u8,
     cache_root: Cache.Directory,
+    cache: *Cache,
     root_name: []const u8,
 
     environ_map: ?*std.process.Environ.Map = null,
     cache_manifest: ?*Cache.Manifest = null,
+    prefix_map: [5]u8 = .{ 0, 1, 2, 3, 4 },
     arch_os_abi: ?[]const u8 = null,
     cpu_features: ?[]const u8 = null,
     progress_node: std.Progress.Node = .none,
@@ -1850,7 +1852,7 @@ pub const BuildExeSubprocessError = error{
 
 pub const BuildExeSubprocessResult = struct {
     received_fs_inputs: bool,
-    cache_hit: bool,
+    cache_result: Cache.Manifest.CheckResult,
     path: Cache.Path,
 };
 
@@ -1913,7 +1915,7 @@ pub fn buildExeSubprocess(
     const error_bundle = options.error_bundle orelse &default_error_bundle;
 
     var received_fs_inputs = false;
-    var cache_hit = false;
+    var cache_result: Cache.Manifest.CheckResult = .incomplete_manifest;
 
     var eos_err: error{EndOfStream}!void = {};
 
@@ -1950,36 +1952,40 @@ pub fn buildExeSubprocess(
                     else => |e| return e,
                 };
             },
-            .emit_digest => {
-                const EmitDigest = Server.Message.EmitDigest;
-                const ebp_hdr: *align(1) const EmitDigest = @ptrCast(body);
-                cache_hit = ebp_hdr.flags.cache_hit;
-                const digest = body[@sizeOf(EmitDigest)..][0..Cache.bin_digest_len];
+            .cache_manifest => {
+                var body_r: std.Io.Reader = .fixed(body);
+                const cache_manifest = body_r.takeStruct(std.zig.Server.Message.CacheManifest, .little) catch unreachable;
+                var diag: Cache.Manifest.CheckDiagnostic = undefined;
+                var man = options.cache.obtain();
+                defer man.deinit();
+                man.openFile(&cache_manifest.input_hash, &diag) catch |err| switch (err) {
+                    else => |e| return e,
+                    error.CacheCheckFailed => {
+                        log.err("opening cache manifest failed: {f}", .{diag.fmt(&man)});
+                        return error.AlreadyReported;
+                    },
+                };
+
+                cache_result = switch (cache_manifest.cache_status.result) {
+                    .hit => .hit,
+                    .incomplete_manifest => .incomplete_manifest,
+                    .invalid_manifest => .invalid_manifest,
+                    .path_deleted => .{ .path_deleted = @fromBackingInt(cache_manifest.cache_status.file_off) },
+                    .directory_status_changed => .{ .directory_status_changed = @fromBackingInt(cache_manifest.cache_status.file_off) },
+                    .metadata_changed => .{ .metadata_changed = @fromBackingInt(cache_manifest.cache_status.file_off) },
+                    .contents_changed => .{ .contents_changed = @fromBackingInt(cache_manifest.cache_status.file_off) },
+                };
+
+                if (options.cache_manifest) |parent_man| {
+                    try parent_man.addDiscoveredManifest(&man, options.prefix_map);
+                    received_fs_inputs = true;
+                }
+
                 if (result) |r| gpa.free(r.sub_path);
                 result = .{
                     .root_dir = options.cache_root,
-                    .sub_path = try Dir.path.join(gpa, &.{ "o", &Cache.binToHex(digest.*) }),
+                    .sub_path = try Dir.path.join(gpa, &.{ "o", &Cache.binToHex(cache_manifest.discovered_hash) }),
                 };
-            },
-            .file_system_inputs => if (options.cache_manifest) |man| {
-                received_fs_inputs = true;
-                var it = mem.splitScalar(u8, body, 0);
-                while (it.next()) |prefixed_path| {
-                    const prefix: Server.Message.PathPrefix = @fromBackingInt(@intCast(prefixed_path[0] - 1));
-                    const sub_path = prefixed_path[1..];
-                    man.addDiscoveredPath(.{
-                        .discovered_path = .{ .prefixed = .{
-                            .prefix = @intCast(@backingInt(prefix)),
-                            .sub_path = sub_path,
-                        } },
-                    }) catch |err| switch (err) {
-                        error.Canceled, error.OutOfMemory => |e| return e,
-                        else => |e| {
-                            log.err("adding {t} {s} to cache failed: {t}", .{ prefix, sub_path, e });
-                            return error.AlreadyReported;
-                        },
-                    };
-                }
             },
             else => {}, // ignore other messages
         }
@@ -2051,7 +2057,7 @@ pub fn buildExeSubprocess(
     defer gpa.free(bin_name);
     return .{
         .received_fs_inputs = received_fs_inputs,
-        .cache_hit = cache_hit,
+        .cache_result = cache_result,
         .path = try base_path.join(gpa, bin_name),
     };
 }

@@ -1186,7 +1186,8 @@ test "switch with tag capture" {
                     _ = &tag;
                     comptime unreachable;
                 },
-                else => |un| {
+                else => |un, tag| {
+                    try expect(tag == .c);
                     try expect(un == .c);
                     try expect(un.c == 0xFF);
                 },

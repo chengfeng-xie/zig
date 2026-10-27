@@ -834,6 +834,10 @@ pub fn build(b: *std.Build) !void {
     const test_llvm_step = b.step("test-llvm", "Run the LLVM IR tests");
     try tests.addRunnerTests(b, runner, test_llvm_step, "test/llvm", @import("test/llvm/matrix.zon"), runner_opts);
     test_step.dependOn(test_llvm_step);
+
+    const test_safety_step = b.step("test-safety", "Run the safety check tests");
+    try tests.addRunnerTests(b, runner, test_safety_step, "test/safety", @import("test/safety/matrix.zon"), runner_opts);
+    test_step.dependOn(test_safety_step);
 }
 
 fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {

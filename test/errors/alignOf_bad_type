@@ -1,0 +1,20 @@
+#zig build-obj {
+--name test -fno-emit-bin
+-Mroot=test.zig
+#}
+
+#write test.zig {
+export fn entry0() usize {
+    return @alignOf(noreturn);
+}
+const S = struct { a: u32, b: noreturn };
+export fn entry1() usize {
+    return @alignOf(S);
+}
+#}
+#update
+#check errors {
+test.zig:2:21: error: no align available for uninstantiable type 'noreturn'
+test.zig:6:21: error: no align available for uninstantiable type 'test.S'
+test.zig:4:11: note: struct declared here
+#}

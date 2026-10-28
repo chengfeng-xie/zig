@@ -488,7 +488,7 @@ pub const Target = struct {
         cbe,
     };
     pub const Linker = enum { default, lld, old, new };
-    pub const Pic = enum { default, nopic, pic, pie };
+    pub const Pic = enum { default, no, pic, pie };
 };
 
 gpa: std.mem.Allocator,
@@ -510,7 +510,7 @@ const Args = struct {
     zig_exe: ?std.Io.File,
     lib_dir: ?std.Io.Dir,
     src_dir: ?std.Io.Dir,
-    targets: std.ArrayList(u32),
+    targets: std.array_hash_map.Custom(u32, struct { skipped: bool }, void, true),
     target_bytes: std.ArrayList(u8),
 
     libc_runtimes_dir: ?std.Io.Dir,
@@ -525,17 +525,47 @@ const Args = struct {
 
     quiet: bool,
 
+    const TargetAdapter = struct {
+        bytes: []const u8,
+
+        pub fn hash(_: @This(), key: []const u8) u32 {
+            return @truncate(std.hash.Wyhash.hash(0, key));
+        }
+
+        pub fn eql(ctx: @This(), lhs_key: []const u8, rhs_key: u32, _: usize) bool {
+            return std.mem.eql(u8, lhs_key, std.mem.sliceTo(ctx.bytes[rhs_key..], 0));
+        }
+    };
+
     fn deinit(args: *Args, gpa: std.mem.Allocator) void {
         args.targets.deinit(gpa);
         args.target_bytes.deinit(gpa);
         args.* = undefined;
     }
 
-    fn addTarget(args: *Args, gpa: std.mem.Allocator, target: []const u8) std.mem.Allocator.Error!void {
+    fn addTarget(
+        args: *Args,
+        gpa: std.mem.Allocator,
+        target: []const u8,
+        skipped: bool,
+    ) std.mem.Allocator.Error!void {
         try args.target_bytes.ensureUnusedCapacity(gpa, target.len + 1);
-        try args.targets.append(gpa, @intCast(args.target_bytes.items.len));
+        const gop = try args.targets.getOrPutAdapted(gpa, target, TargetAdapter{
+            .bytes = args.target_bytes.items,
+        });
+        assert(!gop.found_existing);
+        gop.key_ptr.* = @intCast(args.target_bytes.items.len);
+        gop.value_ptr.* = .{ .skipped = skipped };
         args.target_bytes.appendSliceAssumeCapacity(target);
         args.target_bytes.appendAssumeCapacity(0);
+    }
+
+    fn getTargetIndex(args: *const Args, target: []const u8) ?usize {
+        return args.targets.getIndexAdapted(target, TargetAdapter{ .bytes = args.target_bytes.items });
+    }
+
+    fn getTarget(args: *const Args, index: usize) []const u8 {
+        return std.mem.sliceTo(args.target_bytes.items[args.targets.keys()[index]..], 0);
     }
 };
 
@@ -584,6 +614,7 @@ pub fn runServer(runner: *Runner) ProtocolError {
                     @"--lib",
                     @"--src",
                     @"--target",
+                    @"--skipped-target",
                     @"--libc-runtimes",
                     @"--gdb",
                     @"--lldb",
@@ -598,6 +629,7 @@ pub fn runServer(runner: *Runner) ProtocolError {
                     .@"--lib" = .dir,
                     .@"--src" = .dir,
                     .@"--target" = .string,
+                    .@"--skipped-target" = .string,
                     .@"--libc-runtimes" = .dir,
                     .@"--gdb" = .file,
                     .@"--lldb" = .file,
@@ -618,7 +650,12 @@ pub fn runServer(runner: *Runner) ProtocolError {
                                     state = .@"--target";
                                     continue;
                                 } else if (std.mem.cutPrefix(u8, string, "--target=")) |target| {
-                                    try runner.args.addTarget(runner.gpa, target);
+                                    try runner.args.addTarget(runner.gpa, target, false);
+                                } else if (std.mem.eql(u8, string, "--skipped-target")) {
+                                    state = .@"--skipped-target";
+                                    continue;
+                                } else if (std.mem.cutPrefix(u8, string, "--skipped-target=")) |target| {
+                                    try runner.args.addTarget(runner.gpa, target, true);
                                 } else if (std.mem.eql(u8, string, "--libc-runtimes")) {
                                     state = .@"--libc-runtimes";
                                     continue;
@@ -641,7 +678,12 @@ pub fn runServer(runner: *Runner) ProtocolError {
                                 } else if (std.mem.eql(u8, string, "--quiet")) {
                                     runner.args.quiet = true;
                                 },
-                                .@"--target" => try runner.args.addTarget(runner.gpa, string),
+                                .@"--target" => try runner.args.addTarget(runner.gpa, string, false),
+                                .@"--skipped-target" => try runner.args.addTarget(
+                                    runner.gpa,
+                                    string,
+                                    true,
+                                ),
                                 else => return runner.fail(
                                     "\"{t}\" expected {t}, got {t}",
                                     .{ state, state_expected.get(state), arg },
@@ -1068,7 +1110,10 @@ pub const DelimitedReader = struct {
 };
 
 const Update = struct {
-    target_query: []const u8,
+    runner: *Runner,
+    test_index: u32,
+    skipped: ?bool,
+    invalid_skip: bool,
     manifest_sr: SourceReader,
     compiler: ?Compiler,
     src_dir: std.Io.Dir,
@@ -1079,11 +1124,9 @@ const Update = struct {
     name: []const u8,
     prog_node: std.Progress.Node,
     mtime: std.Io.Timestamp,
-    allow_skip: bool,
 
     fn checkPattern(
         update: *const Update,
-        runner: *Runner,
         what: []const u8,
         expected: []const u8,
         actual: []const u8,
@@ -1093,7 +1136,7 @@ const Update = struct {
             []const Pattern,
         },
     ) FailError!void {
-        const gpa = runner.gpa;
+        const gpa = update.runner.gpa;
         var captures: std.array_hash_map.String(usize) = .empty;
         defer captures.deinit(gpa);
         var expected_pattern: Pattern.Compiled = .empty;
@@ -1274,14 +1317,16 @@ const TestError = error{
     SkipTest,
 } || FailError;
 fn testOne(runner: *Runner, test_index: u32) (error{ServerWriteFailed} || TestError)!void {
-    const target_query =
-        std.mem.sliceTo(runner.args.target_bytes.items[runner.args.targets.items[test_index]..], 0);
+    if (runner.args.targets.values()[test_index].skipped) return error.SkipTest;
     const manifest_file = runner.args.manifest_file orelse
         return runner.fail("missing \"path/to/test\" arg", .{});
     var manifest_buffer: [512]u8 = undefined;
     var manifest_fr = manifest_file.reader(runner.io, &manifest_buffer);
     var update: Update = .{
-        .target_query = target_query,
+        .runner = runner,
+        .test_index = test_index,
+        .skipped = null,
+        .invalid_skip = false,
         .manifest_sr = .init(&manifest_fr.interface, runner.gpa, &runner.eb_wip, src_path_string: {
             var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const src_path = src_path: {
@@ -1296,14 +1341,18 @@ fn testOne(runner: *Runner, test_index: u32) (error{ServerWriteFailed} || TestEr
             break :src_path_string try runner.eb_wip.addString(src_path);
         }),
         .compiler = null,
-        .src_dir = (runner.args.src_dir orelse
-            return runner.fail("missing \"--src=path/to/src\" arg", .{})).createDirPathOpen(
-            runner.io,
-            target_query,
-            .{},
-        ) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            else => |e| return runner.fail("unable to create {q}: {t}", .{ target_query, e }),
+        .src_dir = src_dir: {
+            const target_query = runner.args.getTarget(test_index);
+            const src_root = runner.args.src_dir orelse
+                return runner.fail("missing \"--src=path/to/src\" arg", .{});
+            break :src_dir src_root.createDirPathOpen(
+                runner.io,
+                target_query,
+                .{},
+            ) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return runner.fail("unable to create {q}: {t}", .{ target_query, e }),
+            };
         },
         .cmd_src_loc = undefined,
         .contents_src_loc = undefined,
@@ -1312,7 +1361,6 @@ fn testOne(runner: *Runner, test_index: u32) (error{ServerWriteFailed} || TestEr
         .name = undefined,
         .prog_node = .none,
         .mtime = .now(runner.io, .real),
-        .allow_skip = true,
     };
     defer {
         update.manifest_sr.deinit();
@@ -1514,21 +1562,57 @@ fn handleCommand(
     arg: ?[]const u8,
     contents_r: *std.Io.Reader,
 ) (error{ContentsReadFailed} || TestError)!void {
+    const arena = runner.arena.allocator();
+
     var name_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
     const cmd_prog_node = runner.prog_node.start(std.mem.print(&name_buffer, "#{t}{s}{s}", .{
         cmd, if (arg) |_| " " else "", arg orelse "",
     }) catch &name_buffer, 0);
     defer cmd_prog_node.end();
 
+    switch (cmd) {
+        .comment => {},
+        .skip => if (update.skipped == false) return update.manifest_sr.fail(
+            cmd_src_loc,
+            "\"#skip\" must appear before other commands",
+            .{},
+        ),
+        else => {
+            if (update.invalid_skip) return error.AlreadyReported;
+            if (update.skipped == true) return error.SkipTest;
+            update.skipped = false;
+        },
+    }
+
     cmd: switch (cmd) {
         .comment => _ = contents_r.discardRemaining() catch |err| switch (err) {
             error.ReadFailed => {},
         },
-        .skip => if (!update.allow_skip) return update.manifest_sr.fail(
-            cmd_src_loc,
-            "\"#skip\" must appear before other commands",
-            .{},
-        ) else if (std.mem.eql(u8, update.target_query, arg.?)) return error.SkipTest,
+        .skip => {
+            const skip_target = arg.?;
+            if (runner.args.getTargetIndex(skip_target)) |skip_target_index| {
+                if (skip_target_index == update.test_index) update.skipped = true;
+            } else if (update.test_index == 0) {
+                const eb_wip = update.manifest_sr.eb_wip;
+                const ErrorMessage = std.zig.ErrorBundle.ErrorMessage;
+                const notes: []const ErrorMessage = if (!update.invalid_skip) notes: {
+                    const targets_count = runner.args.targets.count();
+                    const notes = try arena.alloc(ErrorMessage, targets_count);
+                    for (notes, 0..) |*note, target_index| note.* = .{
+                        .msg = try eb_wip.printString("matrix contains {q}", .{
+                            runner.args.getTarget(target_index),
+                        }),
+                    };
+                    break :notes notes;
+                } else &.{};
+                try eb_wip.addRootErrorMessageWithNotes(.{
+                    .msg = try eb_wip.addString("target not in matrix"),
+                    .src_loc = try update.manifest_sr.srcLoc(skip_target),
+                    .notes_len = @intCast(notes.len),
+                }, notes);
+                update.invalid_skip = true;
+            } else return error.SkipTest;
+        },
         .zig => runner.spawnCompiler(
             &update.compiler,
             update.src_dir,
@@ -1536,28 +1620,27 @@ fn handleCommand(
                 return update.manifest_sr.fail(arg.?, "unknown compiler command", .{}),
             contents_r,
             target: {
-                var component_it = std.mem.splitBackwardsScalar(u8, update.target_query, '-');
+                const target_query = runner.args.getTarget(update.test_index);
+                var component_it = std.mem.splitBackwardsScalar(u8, target_query, '-');
                 const pic_str = component_it.next() orelse
-                    return update.fail("target {q} missing pic", .{update.target_query});
+                    return update.fail("target {q} missing pic", .{target_query});
                 const pic = std.meta.stringToEnum(Target.Pic, pic_str) orelse
-                    return update.fail("target {q} unknown pic {q}", .{ update.target_query, pic_str });
+                    return update.fail("target {q} unknown pic {q}", .{ target_query, pic_str });
                 const linker_str = component_it.next() orelse
-                    return update.fail("target {q} missing linker", .{update.target_query});
+                    return update.fail("target {q} missing linker", .{target_query});
                 const linker = std.meta.stringToEnum(Target.Linker, linker_str) orelse
-                    return update.fail("target {q} unknown linker {q}", .{
-                        update.target_query, linker_str,
-                    });
+                    return update.fail("target {q} unknown linker {q}", .{ target_query, linker_str });
                 const backend_str = component_it.next() orelse
-                    return update.fail("target {q} missing backend", .{update.target_query});
+                    return update.fail("target {q} missing backend", .{target_query});
                 const backend = std.meta.stringToEnum(Target.Backend, backend_str) orelse
                     return update.fail("target {q} unknown backend {q}", .{
-                        update.target_query, backend_str,
+                        target_query, backend_str,
                     });
                 const cache_mode_str = component_it.next() orelse
-                    return update.fail("target {q} missing cache mode", .{update.target_query});
+                    return update.fail("target {q} missing cache mode", .{target_query});
                 const cache_mode = std.meta.stringToEnum(Target.CacheMode, cache_mode_str) orelse
                     return update.fail("target {q} unknown cache mode {q}", .{
-                        update.target_query, cache_mode_str,
+                        target_query, cache_mode_str,
                     });
                 const triple_cpu = component_it.rest();
                 var triple_len: usize = 0;
@@ -1566,7 +1649,7 @@ fn handleCommand(
                     triple_len = if (std.mem.findScalarPos(u8, triple_cpu, triple_len, '-')) |dash_pos|
                         dash_pos + 1
                     else
-                        return update.fail("target {q} missing cpu", .{update.target_query});
+                        return update.fail("target {q} missing cpu", .{target_query});
                     if (std.mem.eql(u8, triple_cpu[component_start..triple_len], "native-")) break;
                 }
                 const triple = triple_cpu[0 .. triple_len - 1];
@@ -1587,40 +1670,40 @@ fn handleCommand(
                         }) catch |err| switch (err) {
                             error.UnknownArchitecture => return update.fail(
                                 "unable to resolve target {q}: unknown architecture: {q}",
-                                .{ update.target_query, query_parse_diags.unknown_architecture_name.? },
+                                .{ target_query, query_parse_diags.unknown_architecture_name.? },
                             ),
                             error.MissingOperatingSystem => return update.fail(
                                 "unable to resolve target {q}: missing operating system",
-                                .{update.target_query},
+                                .{target_query},
                             ),
                             error.UnknownOperatingSystem => return update.fail(
                                 "unable to resolve target {q}: unknown operating system: {q}",
-                                .{ update.target_query, query_parse_diags.os_name.? },
+                                .{ target_query, query_parse_diags.os_name.? },
                             ),
                             error.InvalidOperatingSystemVersion => return update.fail(
                                 "unable to resolve target {q}: invalid operating system version",
-                                .{update.target_query},
+                                .{target_query},
                             ),
                             error.UnknownApplicationBinaryInterface => return update.fail(
                                 "unable to resolve target {q}: unknown abi",
-                                .{update.target_query},
+                                .{target_query},
                             ),
                             error.InvalidAbiVersion => return update.fail(
                                 "unable to resolve target {q}: invalid abi version",
-                                .{update.target_query},
+                                .{target_query},
                             ),
                             error.UnexpectedExtraField => unreachable, // validated above
                             error.UnknownCpuModel => return update.fail(
                                 "unable to resolve target {q}: unknown cpu: {q}",
-                                .{ update.target_query, query_parse_diags.cpu_name.? },
+                                .{ target_query, query_parse_diags.cpu_name.? },
                             ),
                             error.UnknownCpuFeature => return update.fail(
                                 "unable to resolve target {q}: unknown cpu feature: {q}",
-                                .{ update.target_query, query_parse_diags.unknown_feature_name.? },
+                                .{ target_query, query_parse_diags.unknown_feature_name.? },
                             ),
                             error.UnknownObjectFormat => return update.fail(
                                 "unable to resolve target {q}: unknown object format",
-                                .{update.target_query},
+                                .{target_query},
                             ),
                         },
                     ) catch |err| switch (err) {
@@ -1687,7 +1770,6 @@ fn handleCommand(
                 .{},
             ));
             update.prog_node.end();
-            const arena = runner.arena.allocator();
             update.name = switch (contents_r.readSliceShort(&name_buffer) catch |err| switch (err) {
                 error.ReadFailed => return error.ContentsReadFailed,
             }) {
@@ -1736,8 +1818,8 @@ fn handleCommand(
                 else => {}, // Ignore other messages,
                 .config => {
                     var body_r: std.Io.Reader = .fixed(message.body);
-                    comp.config = body_r.takeStruct(std.zig.Server.Message.Config, .little) catch
-                        unreachable;
+                    comp.config = body_r.takeStruct(std.zig.Server.Message.Config, .little) catch unreachable;
+                    try comp.updateEmitName(body_r.buffered());
                 },
                 .emit_digest => {
                     var body_r: std.Io.Reader = .fixed(message.body);
@@ -1748,13 +1830,11 @@ fn handleCommand(
                     try comp.checkSuccess(update, check, expected, digest);
                 },
                 .error_bundle => {
-                    const eb = std.zig.Server.allocErrorBundle(
-                        runner.arena.allocator(),
-                        message.body,
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => |e| return e,
-                        error.EndOfStream => return update.fail("error bundle truncated", .{}),
-                    };
+                    const eb =
+                        std.zig.Server.allocErrorBundle(arena, message.body) catch |err| switch (err) {
+                            error.OutOfMemory => |e| return e,
+                            error.EndOfStream => return update.fail("error bundle truncated", .{}),
+                        };
                     switch (check) {
                         .errors => {
                             var error_aw: std.Io.Writer.Allocating = .init(runner.gpa);
@@ -1766,7 +1846,7 @@ fn handleCommand(
                             }, &error_aw.writer) catch |err| switch (err) {
                                 error.WriteFailed => return error.OutOfMemory,
                             };
-                            try update.checkPattern(runner, "errors", expected, error_aw.written(), &.{
+                            try update.checkPattern("errors", expected, error_aw.written(), &.{
                                 .{ "builtin.zig:?:?:", .anon, &.{
                                     .{ .@"?" = &.{
                                         .{ .none = &.{
@@ -1895,10 +1975,6 @@ fn handleCommand(
     assert((contents_r.discardRemaining() catch |err| switch (err) {
         error.ReadFailed => return error.ContentsReadFailed,
     }) == 0);
-    switch (cmd) {
-        .comment, .skip => {},
-        else => update.allow_skip = false,
-    }
 }
 
 fn spawnCompiler(
@@ -1928,6 +2004,7 @@ fn spawnCompiler(
         .mr = undefined,
         .client = undefined,
         .target = target,
+        .emit = .bin,
         .emit_name = null,
         .prog_node = .none,
         .config = null,
@@ -1967,15 +2044,12 @@ fn spawnCompiler(
     }
     switch (comp.target.pic) {
         .default => {},
-        .nopic => try argv.appendSlice(gpa, &.{ "-fno-PIC", "-fno-PIE" }),
+        .no => try argv.appendSlice(gpa, &.{ "-fno-PIC", "-fno-PIE" }),
         .pic => try argv.appendSlice(gpa, &.{ "-fPIC", "-fno-PIE" }),
         .pie => try argv.appendSlice(gpa, &.{ "-fPIC", "-fPIE" }),
     }
 
     var need: usize = 1;
-    var state: enum { positional, @"--name" } = .positional;
-    var root_name: ?[]const u8 = null;
-    var emit: ?std.zig.EmitArtifact = .bin;
     while (true) {
         const done = if (args_r.fill(need)) false else |err| switch (err) {
             error.ReadFailed => |e| return e,
@@ -1986,50 +2060,38 @@ fn spawnCompiler(
         const end = std.mem.findAnyPos(u8, buffered, start, "\n ") orelse buffered.len;
         if (end - start > 0) {
             const arg = try arena.dupe(u8, buffered[start..end]);
-            switch (state) {
-                .positional => if (std.mem.eql(u8, arg, "--name")) {
-                    state = .@"--name";
-                } else if (std.mem.cutPrefix(u8, arg, "-ofmt=")) |ofmt| {
-                    comp.target.resolved.ofmt =
-                        std.meta.stringToEnum(std.Target.ObjectFormat, ofmt) orelse
-                        return runner.fail("invalid object format {q}", .{ofmt});
-                } else if (std.mem.cutPrefix(u8, arg, "-M")) |module| {
-                    var module_name_it = std.mem.splitScalar(u8, module, '=');
-                    const module_name = module_name_it.next().?;
-                    root_name = root_name orelse module_name;
-                } else if (std.mem.eql(u8, arg, "-femit-asm")) {
-                    emit = .@"asm";
-                } else if (std.mem.eql(u8, arg, "-femit-bin")) {
-                    emit = .bin;
-                } else if (std.mem.eql(u8, arg, "-femit-docs")) {
-                    emit = .docs;
-                } else if (std.mem.eql(u8, arg, "-femit-h")) {
-                    emit = .h;
-                } else if (std.mem.eql(u8, arg, "-femit-implib")) {
-                    emit = .implib;
-                } else if (std.mem.eql(u8, arg, "-femit-llvm-bc")) {
-                    emit = .llvm_bc;
-                } else if (std.mem.eql(u8, arg, "-femit-llvm-ir")) {
-                    emit = .llvm_ir;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-asm")) {
-                    if (emit == .@"asm") emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-bin")) {
-                    if (emit == .bin) emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-docs")) {
-                    if (emit == .docs) emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-h")) {
-                    if (emit == .h) emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-implib")) {
-                    if (emit == .implib) emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-llvm-bc")) {
-                    if (emit == .llvm_bc) emit = null;
-                } else if (std.mem.eql(u8, arg, "-fno-emit-llvm-ir")) {
-                    if (emit == .llvm_ir) emit = null;
-                },
-                .@"--name" => {
-                    root_name = arg;
-                    state = .positional;
-                },
+            if (std.mem.cutPrefix(u8, arg, "-ofmt=")) |ofmt| {
+                comp.target.resolved.ofmt =
+                    std.meta.stringToEnum(std.Target.ObjectFormat, ofmt) orelse
+                    return runner.fail("invalid object format {q}", .{ofmt});
+            } else if (std.mem.eql(u8, arg, "-femit-asm")) {
+                comp.emit = .@"asm";
+            } else if (std.mem.eql(u8, arg, "-femit-bin")) {
+                comp.emit = .bin;
+            } else if (std.mem.eql(u8, arg, "-femit-docs")) {
+                comp.emit = .docs;
+            } else if (std.mem.eql(u8, arg, "-femit-h")) {
+                comp.emit = .h;
+            } else if (std.mem.eql(u8, arg, "-femit-implib")) {
+                comp.emit = .implib;
+            } else if (std.mem.eql(u8, arg, "-femit-llvm-bc")) {
+                comp.emit = .llvm_bc;
+            } else if (std.mem.eql(u8, arg, "-femit-llvm-ir")) {
+                comp.emit = .llvm_ir;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-asm")) {
+                if (comp.emit == .@"asm") comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-bin")) {
+                if (comp.emit == .bin) comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-docs")) {
+                if (comp.emit == .docs) comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-h")) {
+                if (comp.emit == .h) comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-implib")) {
+                if (comp.emit == .implib) comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-llvm-bc")) {
+                if (comp.emit == .llvm_bc) comp.emit = null;
+            } else if (std.mem.eql(u8, arg, "-fno-emit-llvm-ir")) {
+                if (comp.emit == .llvm_ir) comp.emit = null;
             }
             try argv.append(gpa, arg);
             args_r.toss(end);
@@ -2042,19 +2104,20 @@ fn spawnCompiler(
     }
     try argv.append(gpa, "--listen=-");
 
-    comp.emit_name = if (emit) |e| try e.cacheName(arena, .{
-        .root_name = root_name orelse "root",
-        .cpu_arch = comp.target.resolved.cpu.arch,
-        .os_tag = comp.target.resolved.os.tag,
-        .ofmt = comp.target.resolved.ofmt,
-        .abi = comp.target.resolved.abi,
-        .output_mode = comp.command.outputMode(),
-    }) else null;
+    if (!runner.args.quiet) std.log.info("{f}", .{std.zig.SubprocessCommand{
+        .argv = argv.items,
+        .cwd = cwd_path: {
+            break :cwd_path path_buffer[0 .. src_dir.realPath(
+                runner.io,
+                &path_buffer,
+            ) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => break :cwd_path null,
+            }];
+        },
+    }});
 
-    var name_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
-    comp.prog_node = runner.prog_node.start(std.mem.print(&name_buffer, "compile {s}", .{
-        comp.emit_name orelse root_name orelse "root",
-    }) catch &name_buffer, 0);
+    comp.prog_node = runner.prog_node.start("compile", 0);
     errdefer comp.prog_node.end();
 
     comp.child = std.process.spawn(runner.io, .{
@@ -2088,6 +2151,7 @@ const Compiler = struct {
     mr: std.Io.File.MultiReader,
     client: std.zig.Client,
     target: Compiler.Target,
+    emit: ?std.zig.EmitArtifact,
     emit_name: ?[]const u8,
     prog_node: std.Progress.Node,
     config: ?std.zig.Server.Message.Config,
@@ -2155,6 +2219,23 @@ const Compiler = struct {
             stderr.tossBuffered();
         }
         return .{ .tag = header.tag, .body = body };
+    }
+
+    fn updateEmitName(comp: *Compiler, root_name: []const u8) !void {
+        const emit = comp.emit orelse return;
+        const emit_name = try emit.cacheName(comp.runner.arena.allocator(), .{
+            .root_name = root_name,
+            .cpu_arch = comp.target.resolved.cpu.arch,
+            .os_tag = comp.target.resolved.os.tag,
+            .ofmt = comp.target.resolved.ofmt,
+            .abi = comp.target.resolved.abi,
+            .output_mode = comp.command.outputMode(),
+        });
+        comp.emit_name = emit_name;
+        var name_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+        comp.prog_node.setName(
+            std.mem.print(&name_buffer, "compile {s}", .{emit_name}) catch &name_buffer,
+        );
     }
 
     const Check = enum { errors, stdout, exit, llvm, gdb, lldb };
@@ -2313,7 +2394,7 @@ const Compiler = struct {
                     } },
                 });
                 defer id.deinit(gpa);
-                return update.checkPattern(runner, "LLVM IR", expected, actual, &.{
+                return update.checkPattern("LLVM IR", expected, actual, &.{
                     // Match newline.
                     .{ "\n", .anon, newline },
                     // Match zero or more metadata attachments at the end of a line.
@@ -2757,7 +2838,7 @@ const Compiler = struct {
                         "debugging {q} failed with code {d}",
                         .{ emit_path, code },
                     );
-                    try update.checkPattern(runner, "stdout", expected, result.stdout, &.{
+                    try update.checkPattern("debugger stdout", expected, result.stdout, &.{
                         .{ "#...", .anon, &.{
                             .{ .@"*" = &.{
                                 .{ .none = &.{} },
@@ -2826,8 +2907,8 @@ const Compiler = struct {
             else => {}, // Ignore other messages,
             .config => {
                 var body_r: std.Io.Reader = .fixed(message.body);
-                comp.config =
-                    body_r.takeStruct(std.zig.Server.Message.Config, .little) catch unreachable;
+                comp.config = body_r.takeStruct(std.zig.Server.Message.Config, .little) catch unreachable;
+                try comp.updateEmitName(body_r.buffered());
             },
             .emit_digest => {
                 var body_r: std.Io.Reader = .fixed(message.body);

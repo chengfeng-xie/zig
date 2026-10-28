@@ -1855,6 +1855,12 @@ fn handleCommand(
                                     } },
                                     .{ .literal = ":" },
                                 } },
+                                .{ "/", .anon, &.{
+                                    .{ .any = &.{
+                                        .{ '/', '/' },
+                                        .{ '\\', '\\' },
+                                    } },
+                                } },
                             });
                         },
                         .stdout, .exit, .llvm, .gdb, .lldb => if (eb.errorMessageCount() > 0) {
@@ -2092,6 +2098,13 @@ const Compiler = struct {
                 .@"build-lib" => .Lib,
             };
         }
+
+        fn isTest(cmd: Compiler.Command) bool {
+            return switch (cmd) {
+                .@"build-obj", .@"build-exe", .@"build-lib" => false,
+                .@"test", .@"test-obj" => true,
+            };
+        }
     };
     const Target = struct {
         triple: []const u8,
@@ -2149,7 +2162,10 @@ const Compiler = struct {
         const arena = runner.arena.allocator();
         const io = runner.io;
         const target = &comp.target.resolved;
-        if (check == .errors and expected.len > 0) return; // expect no emitted file
+        switch (check) {
+            else => {},
+            .errors => return, // expect no emitted file
+        }
         const emit_name = comp.emit_name orelse
             return update.fail("unable to perform {t} check without emitted file", .{check});
         const config = &comp.config.?;
@@ -2191,7 +2207,7 @@ const Compiler = struct {
         try environ_map.putAll(&runner.environ_map);
         var script_buffer: [512]u8 = undefined;
         const script_path, const script_file, var script_fw = script: switch (check) {
-            .errors => return,
+            .errors => unreachable,
             .stdout, .exit => .{ undefined, null, undefined },
             .llvm => {
                 var emit_fr = emit_file.reader(io, &.{});
@@ -2755,7 +2771,10 @@ const Compiler = struct {
                 .{emit_path},
             ),
         }
-        if (!use_executor and result.stderr.len > 0) {
+        // * Since we do not use the test protocol here yet, ignore stderr output from the test
+        //   runner in terminal mode.
+        // * If we are using an executor such as wine, ignore any stderr spam it may produce.
+        if (!comp.command.isTest() and !use_executor and result.stderr.len > 0) {
             std.log.err("#update {q} generated executable {q} had unexpected stderr:\n{s}", .{
                 update.name, emit_path, result.stderr,
             });

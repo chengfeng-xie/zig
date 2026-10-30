@@ -168,12 +168,20 @@
 //! Empty contents succeed when the compiler produces no compile errors.
 //!
 //! The stdout check succeeds when running the binary produced by the compiler, possibly with an
-//! executor like qemu, exits with exit code 0 and produces the given standard output.  The contents
-//! are a sequence of matches separated by `#...` that are expected to appear in the order given,
-//! with arbitrary contents.
+//! executor like qemu, exits with code 0 and produces the given standard output.  The contents are
+//! a sequence of matches separated by `#...` that are expected to appear in the order given, with
+//! arbitrary contents.
 //!
 //! The exit check succeeds when running the binary as the stdout check does exits with the given
 //! exit code.  The contents are the decimal exit code in ascii with no trailing newline.
+//!
+//! The error-trace check succeed when running the binary as the stdout check does exits with 1,
+//! produces no standard output, and produces the given standard error.  The contents support a few
+//! useful patterns that are not matched exactly:
+//!
+//! * `test.zig:` matches a path ending with `test.zig` as the final component followed by a `:`.
+//! * `0x?` matches any hex address.
+//! * ` (test*)` at the end of a line matches either ` (test)` or `(test.zig)`.
 //!
 //! The llvm check succeeds when the llvm backend produces the given LLVM IR.  The contents support
 //! a variety of useful patterns that are not matched exactly:
@@ -551,12 +559,12 @@ const Args = struct {
         gpa: std.mem.Allocator,
         target: []const u8,
         skipped: bool,
-    ) std.mem.Allocator.Error!void {
+    ) (std.mem.Allocator.Error || error{DuplicateTarget})!void {
         try args.target_bytes.ensureUnusedCapacity(gpa, target.len + 1);
         const gop = try args.targets.getOrPutAdapted(gpa, target, TargetAdapter{
             .bytes = args.target_bytes.items,
         });
-        assert(!gop.found_existing);
+        if (gop.found_existing) return error.DuplicateTarget;
         gop.key_ptr.* = @intCast(args.target_bytes.items.len);
         gop.value_ptr.* = .{ .skipped = skipped };
         args.target_bytes.appendSliceAssumeCapacity(target);
@@ -685,7 +693,17 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                     state = .@"--target";
                                     continue;
                                 } else if (std.mem.cutPrefix(u8, string, "--target=")) |target| {
-                                    try runner.args.addTarget(runner.gpa, target, false);
+                                    runner.args.addTarget(
+                                        runner.gpa,
+                                        target,
+                                        false,
+                                    ) catch |err| switch (err) {
+                                        error.OutOfMemory => |e| return e,
+                                        error.DuplicateTarget => return runner.fail(
+                                            "duplicate target {q}",
+                                            .{target},
+                                        ),
+                                    };
                                 } else if (std.mem.eql(u8, string, "--skipped-target")) {
                                     state = .@"--skipped-target";
                                     continue;
@@ -694,7 +712,17 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                     string,
                                     "--skipped-target=",
                                 )) |target| {
-                                    try runner.args.addTarget(runner.gpa, target, true);
+                                    runner.args.addTarget(
+                                        runner.gpa,
+                                        target,
+                                        true,
+                                    ) catch |err| switch (err) {
+                                        error.OutOfMemory => |e| return e,
+                                        error.DuplicateTarget => return runner.fail(
+                                            "duplicate target {q}",
+                                            .{target},
+                                        ),
+                                    };
                                 } else if (std.mem.eql(u8, string, "--libc-runtimes")) {
                                     state = .@"--libc-runtimes";
                                     continue;
@@ -721,12 +749,32 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                         string,
                                     ) orelse return runner.fail("invalid log level {q}", .{string});
                                 },
-                                .@"--target" => try runner.args.addTarget(runner.gpa, string, false),
-                                .@"--skipped-target" => try runner.args.addTarget(
-                                    runner.gpa,
-                                    string,
-                                    true,
-                                ),
+                                .@"--target" => {
+                                    runner.args.addTarget(
+                                        runner.gpa,
+                                        string,
+                                        false,
+                                    ) catch |err| switch (err) {
+                                        error.OutOfMemory => |e| return e,
+                                        error.DuplicateTarget => return runner.fail(
+                                            "duplicate target {q}",
+                                            .{string},
+                                        ),
+                                    };
+                                },
+                                .@"--skipped-target" => {
+                                    runner.args.addTarget(
+                                        runner.gpa,
+                                        string,
+                                        true,
+                                    ) catch |err| switch (err) {
+                                        error.OutOfMemory => |e| return e,
+                                        error.DuplicateTarget => return runner.fail(
+                                            "duplicate target {q}",
+                                            .{string},
+                                        ),
+                                    };
+                                },
                                 else => return runner.fail(
                                     "\"{t}\" expected {t}, got {t}",
                                     .{ state, state_expected.get(state), arg },
@@ -1168,6 +1216,13 @@ pub const DelimitedReader = struct {
         d.remaining = d.remaining.subtract(n).?;
         return n;
     }
+};
+
+const newline: []const Pattern = &.{
+    .{ .@"?" = &.{
+        .{ .literal = "\r" },
+    } },
+    .{ .literal = "\n" },
 };
 
 const Update = struct {
@@ -1939,122 +1994,72 @@ fn handleCommand(
                             error.OutOfMemory => |e| return e,
                             error.EndOfStream => return update.fail("error bundle truncated", .{}),
                         };
-                    switch (check) {
-                        .errors => {
-                            var error_aw: std.Io.Writer.Allocating = .init(runner.gpa);
-                            defer error_aw.deinit();
-                            eb.renderToWriter(.{
-                                .include_reference_trace = false,
-                                .include_source_line = false,
-                                .include_log_text = true,
-                            }, &error_aw.writer) catch |err| switch (err) {
-                                error.WriteFailed => return error.OutOfMemory,
-                            };
-                            try update.checkPattern("errors", expected, error_aw.written(), &.{
-                                .{ "\n", .anon, newline },
-                                .{ "/", .anon, &.{
-                                    .{ .any = &.{
-                                        .{ '/', '/' },
-                                        .{ '\\', '\\' },
+                    if (check == .errors) {
+                        var error_aw: std.Io.Writer.Allocating = .init(runner.gpa);
+                        defer error_aw.deinit();
+                        eb.renderToWriter(.{
+                            .include_reference_trace = false,
+                            .include_source_line = false,
+                            .include_log_text = true,
+                        }, &error_aw.writer) catch |err| switch (err) {
+                            error.WriteFailed => return error.OutOfMemory,
+                        };
+                        try update.checkPattern("errors", expected, error_aw.written(), &.{
+                            .{ "\n", .anon, newline },
+                            .{ "/", .anon, &.{
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
+                                } },
+                            } },
+                            .{ "builtin.zig:?:?:", .anon, &.{
+                                .{ .none = &.{
+                                    .{ '\n', '\n' },
+                                    .{ '\r', '\r' },
+                                    .{ ' ', ' ' },
+                                    .{ ':', ':' },
+                                } },
+                                .{ .@"*" = &.{
+                                    .{ .none = &.{
+                                        .{ '\n', '\n' },
+                                        .{ '\r', '\r' },
                                     } },
                                 } },
-                                .{ "builtin.zig:?:?:", .anon, &.{
-                                    .{ .@"?" = &.{
-                                        .{ .none = &.{
-                                            .{ '\n', '\n' },
-                                            .{ '\r', '\r' },
-                                            .{ ' ', ' ' },
-                                            .{ ':', ':' },
-                                        } },
-                                        .{ .@"*" = &.{
-                                            .{ .none = &.{
-                                                .{ '\n', '\n' },
-                                                .{ '\r', '\r' },
-                                            } },
-                                        } },
-                                    } },
-                                    .{ .any = &.{
-                                        .{ '/', '/' },
-                                        .{ '\\', '\\' },
-                                    } },
-                                    .{ .literal = "b" },
-                                    .{ .any = &.{
-                                        .{ '/', '/' },
-                                        .{ '\\', '\\' },
-                                    } },
-                                    .{ .@"+" = &.{
-                                        .{ .any = &.{
-                                            .{ '0', '9' },
-                                            .{ 'a', 'f' },
-                                        } },
-                                    } },
-                                    .{ .any = &.{
-                                        .{ '/', '/' },
-                                        .{ '\\', '\\' },
-                                    } },
-                                    .{ .literal = "builtin.zig:" },
-                                    .{ .@"+" = &.{
-                                        .{ .any = &.{
-                                            .{ '0', '9' },
-                                        } },
-                                    } },
-                                    .{ .literal = ":" },
-                                    .{ .@"+" = &.{
-                                        .{ .any = &.{
-                                            .{ '0', '9' },
-                                        } },
-                                    } },
-                                    .{ .literal = ":" },
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
                                 } },
-                                .{ "lib/std/**.zig:?:?: note: called inline here\n", .anon, &.{
-                                    .{ .@"*" = &[_]Pattern{
-                                        .{ .@"?" = &.{
-                                            .{ .none = &.{
-                                                .{ '\n', '\n' },
-                                                .{ '\r', '\r' },
-                                                .{ ' ', ' ' },
-                                                .{ ':', ':' },
-                                            } },
-                                            .{ .@"*" = &.{
-                                                .{ .none = &.{
-                                                    .{ '\n', '\n' },
-                                                    .{ '\r', '\r' },
-                                                } },
-                                            } },
-                                        } },
-                                        .{ .literal = "lib" },
-                                        .{ .any = &.{
-                                            .{ '/', '/' },
-                                            .{ '\\', '\\' },
-                                        } },
-                                        .{ .literal = "std" },
-                                        .{ .any = &.{
-                                            .{ '/', '/' },
-                                            .{ '\\', '\\' },
-                                        } },
-                                        .{ .@"+" = &.{
-                                            .{ .none = &.{
-                                                .{ '\n', '\n' },
-                                                .{ '\r', '\r' },
-                                                .{ ':', ':' },
-                                            } },
-                                        } },
-                                        .{ .literal = ".zig:" },
-                                        .{ .@"+" = &.{
-                                            .{ .any = &.{
-                                                .{ '0', '9' },
-                                            } },
-                                        } },
-                                        .{ .literal = ":" },
-                                        .{ .@"+" = &.{
-                                            .{ .any = &.{
-                                                .{ '0', '9' },
-                                            } },
-                                        } },
-                                        .{ .literal = ": note: called inline here" },
-                                    } ++ newline },
+                                .{ .literal = "b" },
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
                                 } },
-                                .{ "lib/std/**.zig:?:?:", .anon, &.{
+                                .{ .@"+" = &.{
+                                    .{ .any = &.{
+                                        .{ '0', '9' },
+                                        .{ 'a', 'f' },
+                                    } },
+                                } },
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
+                                } },
+                                .{ .literal = "builtin.zig:" },
+                                .{ .@"+" = &.{
+                                    .{ .any = &.{
+                                        .{ '0', '9' },
+                                    } },
+                                } },
+                                .{ .literal = ":" },
+                                .{ .@"+" = &.{
+                                    .{ .any = &.{
+                                        .{ '0', '9' },
+                                    } },
+                                } },
+                                .{ .literal = ":" },
+                            } },
+                            .{ "lib/std/**.zig:?:?: note: called inline here\n", .anon, &.{
+                                .{ .@"*" = &[_]Pattern{
                                     .{ .@"?" = &.{
                                         .{ .none = &.{
                                             .{ '\n', '\n' },
@@ -2098,17 +2103,62 @@ fn handleCommand(
                                             .{ '0', '9' },
                                         } },
                                     } },
-                                    .{ .literal = ":" },
+                                    .{ .literal = ": note: called inline here" },
+                                } ++ newline },
+                            } },
+                            .{ "lib/std/**.zig:?:?:", .anon, &.{
+                                .{ .@"?" = &.{
+                                    .{ .none = &.{
+                                        .{ '\n', '\n' },
+                                        .{ '\r', '\r' },
+                                        .{ ' ', ' ' },
+                                        .{ ':', ':' },
+                                    } },
+                                    .{ .@"*" = &.{
+                                        .{ .none = &.{
+                                            .{ '\n', '\n' },
+                                            .{ '\r', '\r' },
+                                        } },
+                                    } },
                                 } },
-                            });
-                        },
-                        .stdout, .exit, .llvm, .gdb, .lldb => if (eb.errorMessageCount() > 0) {
-                            eb.renderToStderr(runner.io, .{}, .auto) catch |err| switch (err) {
-                                error.Canceled => {},
-                                else => {},
-                            };
-                            return update.fail("unexpected compile errors", .{});
-                        },
+                                .{ .literal = "lib" },
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
+                                } },
+                                .{ .literal = "std" },
+                                .{ .any = &.{
+                                    .{ '/', '/' },
+                                    .{ '\\', '\\' },
+                                } },
+                                .{ .@"+" = &.{
+                                    .{ .none = &.{
+                                        .{ '\n', '\n' },
+                                        .{ '\r', '\r' },
+                                        .{ ':', ':' },
+                                    } },
+                                } },
+                                .{ .literal = ".zig:" },
+                                .{ .@"+" = &.{
+                                    .{ .any = &.{
+                                        .{ '0', '9' },
+                                    } },
+                                } },
+                                .{ .literal = ":" },
+                                .{ .@"+" = &.{
+                                    .{ .any = &.{
+                                        .{ '0', '9' },
+                                    } },
+                                } },
+                                .{ .literal = ":" },
+                            } },
+                        });
+                    } else if (eb.errorMessageCount() > 0) {
+                        eb.renderToStderr(runner.io, .{}, .auto) catch |err| switch (err) {
+                            error.Canceled => {},
+                            else => {},
+                        };
+                        return update.fail("unexpected compile errors", .{});
                     }
                     comp.state = .idle;
                     break :cmd;
@@ -2409,7 +2459,7 @@ const Compiler = struct {
         );
     }
 
-    const Check = enum { errors, stdout, exit, llvm, gdb, lldb };
+    const Check = enum { errors, stdout, exit, @"error-trace", @"stack-trace", llvm, gdb, lldb };
     fn checkSuccess(
         comp: *Compiler,
         update: *const Update,
@@ -2422,10 +2472,7 @@ const Compiler = struct {
         const arena = runner.arena.allocator();
         const io = runner.io;
         const target = &comp.target.resolved;
-        switch (check) {
-            else => {},
-            .errors => return, // expect no emitted file
-        }
+        if (check == .errors) return; // expect no emitted file
         const emit_name = comp.emit_name orelse
             return update.fail("unable to perform {t} check without emitted file", .{check});
         const config = &comp.config.?;
@@ -2469,6 +2516,11 @@ const Compiler = struct {
         const script_path, const script_file, var script_fw = script: switch (check) {
             .errors => unreachable,
             .stdout, .exit => .{ undefined, null, undefined },
+            .@"error-trace", .@"stack-trace" => {
+                _ = environ_map.swapRemove("CLICOLOR_FORCE");
+                try environ_map.put("NO_COLOR", "1"); // affects output formatting
+                break :script .{ undefined, null, undefined };
+            },
             .llvm => {
                 var emit_fr = emit_file.reader(io, &.{});
                 const actual = emit_fr.interface.readAllocAll(arena, @intCast(
@@ -2888,7 +2940,10 @@ const Compiler = struct {
         const result = std.process.run(gpa, io, .{
             .exe = exe: switch (check) {
                 .errors, .llvm => unreachable,
-                .stdout, .exit => if (use_executor) .search else .{ .file = emit_file },
+                .stdout, .exit, .@"error-trace", .@"stack-trace" => if (use_executor)
+                    .search
+                else
+                    .{ .file = emit_file },
                 .gdb, .lldb => {
                     if (use_executor) {
                         std.log.info(
@@ -2951,6 +3006,11 @@ const Compiler = struct {
             .cwd = .{ .dir = update.src_dir },
             .environ_map = &environ_map,
             .progress_node = run_prog_node,
+            .inherit_files = switch (check) {
+                .errors, .llvm => unreachable,
+                .stdout, .exit, .gdb, .lldb => &.{},
+                .@"error-trace", .@"stack-trace" => &.{emit_file},
+            },
         }) catch |err| if (use_executor) {
             // Chances are the foreign executor isn't available. Skip this evaluation.
             std.log.info(
@@ -2970,7 +3030,7 @@ const Compiler = struct {
                 .errors, .llvm => unreachable,
                 .stdout => {
                     if (code != 0) return update.fail(
-                        "generated executable {q} failed with exit code {d}",
+                        "{q} exited with code {d}, expected code 0",
                         .{ emit_path, code },
                     );
                     try update.checkPattern("stdout", expected, result.stdout, &.{
@@ -2982,10 +3042,56 @@ const Compiler = struct {
                     const actual = std.mem.print(&actual_buffer, "{d}", .{code}) catch unreachable;
                     try update.checkPattern("exit code", expected, actual, &.{});
                 },
+                .@"stack-trace", .@"error-trace" => {
+                    if (code != 1) return update.fail(
+                        "{q} exited with code {d}, expected code 1",
+                        .{ emit_path, code },
+                    );
+                    try update.checkPattern("stderr", expected, result.stderr, &.{
+                        .{ "\n", .anon, newline },
+                        .{ "test.zig:", .anon, &.{
+                            .{ .none = &.{
+                                .{ '\n', '\n' },
+                                .{ '\r', '\r' },
+                                .{ ' ', ' ' },
+                                .{ ':', ':' },
+                            } },
+                            .{ .@"*" = &.{
+                                .{ .none = &.{
+                                    .{ '\n', '\n' },
+                                    .{ '\r', '\r' },
+                                } },
+                            } },
+                            .{ .any = &.{
+                                .{ '/', '/' },
+                                .{ '\\', '\\' },
+                            } },
+                            .{ .literal = "test.zig:" },
+                        } },
+                        .{ "0x?", .anon, &.{
+                            .{ .literal = "0x" },
+                            .{ .@"+" = &.{
+                                .{ .any = &.{
+                                    .{ '0', '9' },
+                                    .{ 'a', 'f' },
+                                } },
+                            } },
+                        } },
+                        .{ "(test*)", .anon, &.{
+                            .{ .literal = "(test" },
+                            .{ .@"?" = &.{
+                                .{ .literal = ".zig" },
+                            } },
+                            .{ .literal = ")" },
+                        } },
+                    });
+                    try update.checkPattern("stdout", "", result.stdout, &.{});
+                    return; // skip stderr check below
+                },
                 .gdb, .lldb => {
                     if (code != debug_success) return update.fail(
-                        "debugging {q} failed with exit code {d}",
-                        .{ emit_path, code },
+                        "debugging {q} exited with code {d}, expected code {d}",
+                        .{ emit_path, code, debug_success },
                     );
                     try update.checkPattern("debugger stdout", expected, result.stdout, &.{
                         .{ "\n", .anon, newline },
@@ -3158,8 +3264,9 @@ const ClientArgs = struct {
     gdb_exe: ?std.Io.File,
     lldb_exe: ?std.Io.File,
 
-    targets: []const []const u8,
     matrix: []const Target,
+    targets: []const []const u8,
+    target_filters: []const []const u8,
     skip_matrix: bool,
 };
 pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelable)!u8 {
@@ -3186,8 +3293,9 @@ pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelabl
         .gdb_exe = null,
         .lldb_exe = null,
 
-        .targets = &.{},
         .matrix = &.{},
+        .targets = &.{},
+        .target_filters = &.{},
         .skip_matrix = undefined,
     };
 
@@ -3197,9 +3305,11 @@ pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelabl
     var libc_runtimes_path_arg: ?[]const u8 = null;
     var gdb_path_arg: ?[]const u8 = null;
     var lldb_path_arg: ?[]const u8 = null;
-    var targets: std.ArrayList([]const u8) = .empty;
-    defer targets.deinit(init.gpa);
     var matrix_path_arg: ?[]const u8 = null;
+    var target_args: std.ArrayList([]const u8) = .empty;
+    defer target_args.deinit(init.gpa);
+    var target_filter_args: std.ArrayList([]const u8) = .empty;
+    defer target_filter_args.deinit(init.gpa);
     var skip_matrix_arg: ?bool = null;
 
     var arg_it = try init.minimal.args.iterateAllocator(arena);
@@ -3271,26 +3381,32 @@ pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelabl
                 },
             };
             return 0;
-        } else if (std.mem.eql(u8, arg, "--quiet")) {
-            args.quiet = true;
+        } else if (if (std.mem.eql(u8, arg, "--log-level"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--log-level=")) |log_level|
+        {
+            args.log_level = std.meta.stringToEnum(std.log.Level, log_level) orelse
+                return fatal("invalid arg {q} after {q}", .{ log_level, arg });
         } else if (std.mem.eql(u8, arg, "--keep-src")) {
             args.keep_src = true;
-        } else if (std.mem.eql(u8, arg, "--zig")) {
-            zig_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--zig=")) |zig_path| {
+        } else if (if (std.mem.eql(u8, arg, "--zig"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--zig=")) |zig_path|
+        {
             zig_path_arg = zig_path;
-        } else if (std.mem.eql(u8, arg, "--lib")) {
-            lib_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--lib=")) |lib_path| {
+        } else if (if (std.mem.eql(u8, arg, "--lib"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--lib=")) |lib_path|
+        {
             lib_path_arg = lib_path;
-        } else if (std.mem.eql(u8, arg, "--target")) {
-            try targets.append(init.gpa, arg_it.next() orelse
-                return fatal("missing arg after {q}", .{arg}));
-        } else if (std.mem.cutPrefix(u8, arg, "--target=")) |target| {
-            try targets.append(init.gpa, target);
-        } else if (std.mem.eql(u8, arg, "--libc-runtimes")) {
-            libc_runtimes_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--libc-runtimes=")) |libc_runtimes_path| {
+        } else if (if (std.mem.eql(u8, arg, "--libc-runtimes"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--libc-runtimes=")) |libc_runtimes_path|
+        {
             libc_runtimes_path_arg = libc_runtimes_path;
         } else if (std.mem.eql(u8, arg, "-fdarling")) {
             args.enable_darling = true;
@@ -3302,18 +3418,36 @@ pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelabl
             args.enable_wine = true;
         } else if (std.mem.eql(u8, arg, "-fwasmtime")) {
             args.enable_wasmtime = true;
-        } else if (std.mem.eql(u8, arg, "--gdb")) {
-            gdb_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--gdb=")) |gdb_path| {
+        } else if (if (std.mem.eql(u8, arg, "--gdb"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--gdb=")) |gdb_path|
+        {
             gdb_path_arg = gdb_path;
-        } else if (std.mem.eql(u8, arg, "--lldb")) {
-            lldb_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--lldb=")) |lldb_path| {
+        } else if (if (std.mem.eql(u8, arg, "--lldb"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--lldb=")) |lldb_path|
+        {
             lldb_path_arg = lldb_path;
-        } else if (std.mem.eql(u8, arg, "--matrix")) {
-            matrix_path_arg = arg_it.next() orelse return fatal("missing arg after {q}", .{arg});
-        } else if (std.mem.cutPrefix(u8, arg, "--matrix=")) |matrix_path| {
+        } else if (if (std.mem.eql(u8, arg, "--matrix"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--matrix=")) |matrix_path|
+        {
             matrix_path_arg = matrix_path;
+        } else if (if (std.mem.eql(u8, arg, "--target"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--target=")) |target|
+        {
+            try target_args.append(init.gpa, target);
+        } else if (if (std.mem.eql(u8, arg, "--target-filter"))
+            arg_it.next() orelse return fatal("missing arg after {q}", .{arg})
+        else
+            std.mem.cutPrefix(u8, arg, "--target-filter=")) |target_filter|
+        {
+            try target_filter_args.append(init.gpa, target_filter);
         } else if (std.mem.eql(u8, arg, "--keep-matrix")) {
             skip_matrix_arg = false;
         } else if (std.mem.eql(u8, arg, "--skip-matrix")) {
@@ -3412,7 +3546,8 @@ pub fn main(init: std.process.Init) (std.mem.Allocator.Error || std.Io.Cancelabl
         };
     }
 
-    args.targets = targets.items;
+    args.targets = target_args.items;
+    args.target_filters = target_filter_args.items;
     matrix: {
         const matrix_path = matrix_path_arg orelse try std.Io.Dir.path.join(arena, &.{
             std.Io.Dir.path.dirname(test_path) orelse break :matrix, "matrix.zon",
@@ -3516,9 +3651,14 @@ fn runClient(
 
     var matrix: std.array_hash_map.String(Target.State) = .empty;
     try matrix.ensureTotalCapacity(arena, args.matrix.len + args.targets.len);
-    for (args.matrix) |target| matrix.putAssumeCapacity(try arena.print("{f}", .{target}), .{
-        .skipped = args.skip_matrix,
-    });
+    for (args.matrix) |target| {
+        const target_string = try arena.print("{f}", .{target});
+        matrix.putAssumeCapacity(target_string, .{
+            .skipped = args.skip_matrix or for (args.target_filters) |target_filter| {
+                if (std.mem.find(u8, target_string, target_filter)) |_| break false;
+            } else args.target_filters.len > 0,
+        });
+    }
     for (args.targets) |target| matrix.putAssumeCapacity(target, .{ .skipped = false });
 
     var argv: std.ArrayList(u8) = .empty;
@@ -3711,11 +3851,8 @@ fn runClient(
     return success;
 }
 
-const newline: []const Pattern = &.{
-    .{ .@"?" = &.{
-        .{ .literal = "\r" },
-    } },
-    .{ .literal = "\n" },
+pub const std_options: std.Options = .{
+    .logFn = log,
 };
 var global_log_level = std.log.default_level;
 fn log(

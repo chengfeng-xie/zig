@@ -240,9 +240,14 @@ pub const Target = struct {
     backend: Backend,
     optimize: std.lang.Optimize = .debug,
     pic: Pic = .default,
+    frame_pointers: FramePointers = .default,
+    unwind_tables: UnwindTables = .default,
     linker: Linker = .default,
+    linkage: Linkage = .default,
     link_libc: LinkLibc = .default,
     strip: Strip = .default,
+
+    extra: bool = false,
 
     pub const Cpu = Cpu: {
         @setEvalBranchQuota(4_000);
@@ -470,9 +475,21 @@ pub const Target = struct {
             .default => {},
             else => |pic| try w.print("-{t}", .{pic}),
         }
+        switch (target.frame_pointers) {
+            .default => {},
+            else => |frame_pointers| try w.print("-{t}", .{frame_pointers}),
+        }
+        switch (target.unwind_tables) {
+            .default => {},
+            else => |unwind_tables| try w.print("-{t}", .{unwind_tables}),
+        }
         switch (target.linker) {
             .default => {},
             else => |linker| try w.print("-{t}", .{linker}),
+        }
+        switch (target.linkage) {
+            .default => {},
+            else => |linkage| try w.print("-{t}", .{linkage}),
         }
         switch (target.link_libc) {
             .default => {},
@@ -497,7 +514,10 @@ pub const Target = struct {
         cbe,
     };
     pub const Pic = enum { default, pdc, pic, pie };
+    pub const FramePointers = enum { default, keep, omit };
+    pub const UnwindTables = enum { default, none, sync, async };
     pub const Linker = enum { default, lld, old, new };
+    pub const Linkage = enum { default, static, dynamic };
     pub const LinkLibc = enum { default, lc };
     pub const Strip = enum { default, nostrip, stripdebug, strip };
 
@@ -559,12 +579,12 @@ const Args = struct {
         gpa: std.mem.Allocator,
         target: []const u8,
         skipped: bool,
-    ) (std.mem.Allocator.Error || error{DuplicateTarget})!void {
+    ) (std.mem.Allocator.Error || error{DuplicatedTarget})!void {
         try args.target_bytes.ensureUnusedCapacity(gpa, target.len + 1);
         const gop = try args.targets.getOrPutAdapted(gpa, target, TargetAdapter{
             .bytes = args.target_bytes.items,
         });
-        if (gop.found_existing) return error.DuplicateTarget;
+        if (gop.found_existing) return error.DuplicatedTarget;
         gop.key_ptr.* = @intCast(args.target_bytes.items.len);
         gop.value_ptr.* = .{ .skipped = skipped };
         args.target_bytes.appendSliceAssumeCapacity(target);
@@ -669,6 +689,7 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                     .@"--gdb" = .file,
                     .@"--lldb" = .file,
                 });
+                var duplicated_target = false;
                 var input_dir: std.zig.Server.Message.InputDir = .cwd;
                 var args_body_offset: usize = 0;
                 while (args_body.len - args_body_offset > 0) {
@@ -699,10 +720,13 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                         false,
                                     ) catch |err| switch (err) {
                                         error.OutOfMemory => |e| return e,
-                                        error.DuplicateTarget => return runner.fail(
-                                            "duplicate target {q}",
+                                        error.DuplicatedTarget => switch (runner.fail(
+                                            "duplicated target {q}",
                                             .{target},
-                                        ),
+                                        )) {
+                                            error.Canceled, error.OutOfMemory => |e| return e,
+                                            error.AlreadyReported => duplicated_target = true,
+                                        },
                                     };
                                 } else if (std.mem.eql(u8, string, "--skipped-target")) {
                                     state = .@"--skipped-target";
@@ -718,10 +742,13 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                         true,
                                     ) catch |err| switch (err) {
                                         error.OutOfMemory => |e| return e,
-                                        error.DuplicateTarget => return runner.fail(
-                                            "duplicate target {q}",
+                                        error.DuplicatedTarget => switch (runner.fail(
+                                            "duplicated target {q}",
                                             .{target},
-                                        ),
+                                        )) {
+                                            error.Canceled, error.OutOfMemory => |e| return e,
+                                            error.AlreadyReported => duplicated_target = true,
+                                        },
                                     };
                                 } else if (std.mem.eql(u8, string, "--libc-runtimes")) {
                                     state = .@"--libc-runtimes";
@@ -756,10 +783,13 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                         false,
                                     ) catch |err| switch (err) {
                                         error.OutOfMemory => |e| return e,
-                                        error.DuplicateTarget => return runner.fail(
-                                            "duplicate target {q}",
+                                        error.DuplicatedTarget => switch (runner.fail(
+                                            "duplicated target {q}",
                                             .{string},
-                                        ),
+                                        )) {
+                                            error.Canceled, error.OutOfMemory => |e| return e,
+                                            error.AlreadyReported => duplicated_target = true,
+                                        },
                                     };
                                 },
                                 .@"--skipped-target" => {
@@ -769,10 +799,13 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                                         true,
                                     ) catch |err| switch (err) {
                                         error.OutOfMemory => |e| return e,
-                                        error.DuplicateTarget => return runner.fail(
-                                            "duplicate target {q}",
+                                        error.DuplicatedTarget => switch (runner.fail(
+                                            "duplicated target {q}",
                                             .{string},
-                                        ),
+                                        )) {
+                                            error.Canceled, error.OutOfMemory => |e| return e,
+                                            error.AlreadyReported => duplicated_target = true,
+                                        },
                                     };
                                 },
                                 else => return runner.fail(
@@ -949,6 +982,7 @@ pub fn runServer(runner: *Runner) ProtocolError!void {
                     }
                     state = .positional;
                 }
+                if (duplicated_target) return error.AlreadyReported;
             },
             .query_test_metadata => runner.server.serveTestMetadata(.{
                 .names = runner.args.targets.keys(),
@@ -1763,6 +1797,14 @@ fn handleCommand(
                         );
                         break :link_libc link_libc;
                     } else .default;
+                const linkage: Target.Linkage =
+                    if (std.meta.stringToEnum(Target.Linkage, component)) |linkage| linkage: {
+                        component = component_it.next() orelse return update.fail(
+                            "target {q} missing components before linkage",
+                            .{target_query},
+                        );
+                        break :linkage linkage;
+                    } else .default;
                 const linker: Target.Linker =
                     if (std.meta.stringToEnum(Target.Linker, component)) |linker| linker: {
                         component = component_it.next() orelse return update.fail(
@@ -1771,6 +1813,26 @@ fn handleCommand(
                         );
                         break :linker linker;
                     } else .default;
+                const unwind_tables: Target.UnwindTables = if (std.meta.stringToEnum(
+                    Target.UnwindTables,
+                    component,
+                )) |unwind_tables| unwind_tables: {
+                    component = component_it.next() orelse return update.fail(
+                        "target {q} missing components before unwind tables",
+                        .{target_query},
+                    );
+                    break :unwind_tables unwind_tables;
+                } else .default;
+                const frame_pointers: Target.FramePointers = if (std.meta.stringToEnum(
+                    Target.FramePointers,
+                    component,
+                )) |frame_pointers| frame_pointers: {
+                    component = component_it.next() orelse return update.fail(
+                        "target {q} missing components before frame pointers",
+                        .{target_query},
+                    );
+                    break :frame_pointers frame_pointers;
+                } else .default;
                 const pic: Target.Pic = if (std.meta.stringToEnum(Target.Pic, component)) |pic| pic: {
                     component = component_it.next() orelse return update.fail(
                         "target {q} missing components before pic",
@@ -1869,7 +1931,10 @@ fn handleCommand(
                     .backend = backend,
                     .optimize = optimize,
                     .pic = pic,
+                    .frame_pointers = frame_pointers,
+                    .unwind_tables = unwind_tables,
                     .linker = linker,
+                    .linkage = linkage,
                     .link_libc = link_libc,
                     .strip = strip,
                 };
@@ -2247,11 +2312,26 @@ fn spawnCompiler(
         .pic => try argv.appendSlice(gpa, &.{ "-fPIC", "-fno-PIE" }),
         .pie => try argv.appendSlice(gpa, &.{ "-fPIC", "-fPIE" }),
     }
+    switch (comp.target.frame_pointers) {
+        .default => {},
+        .keep => try argv.append(gpa, "-fno-omit-frame-pointer"),
+        .omit => try argv.append(gpa, "-fomit-frame-pointer"),
+    }
+    switch (comp.target.unwind_tables) {
+        .default => {},
+        .none => try argv.append(gpa, "-fno-unwind-tables"),
+        .sync => try argv.append(gpa, "-funwind-tables"),
+        .async => try argv.append(gpa, "-fasync-unwind-tables"),
+    }
     switch (comp.target.linker) {
         .default => {},
         .lld => try argv.appendSlice(gpa, &.{ "-flld", "-fno-new-linker" }),
         .old => try argv.appendSlice(gpa, &.{ "-fno-lld", "-fno-new-linker" }),
         .new => try argv.appendSlice(gpa, &.{ "-fno-lld", "-fnew-linker" }),
+    }
+    switch (comp.target.linkage) {
+        .default => {},
+        inline .static, .dynamic => |linkage| try argv.append(gpa, "-" ++ @tagName(linkage)),
     }
     switch (comp.target.link_libc) {
         .default => {},
@@ -2401,7 +2481,10 @@ const Compiler = struct {
         backend: ?Runner.Target.Backend,
         optimize: std.lang.Optimize,
         pic: Runner.Target.Pic,
+        frame_pointers: Runner.Target.FramePointers,
+        unwind_tables: Runner.Target.UnwindTables,
         linker: Runner.Target.Linker,
+        linkage: Runner.Target.Linkage,
         link_libc: Runner.Target.LinkLibc,
         strip: Runner.Target.Strip,
     };
@@ -2459,7 +2542,7 @@ const Compiler = struct {
         );
     }
 
-    const Check = enum { errors, stdout, exit, @"error-trace", @"stack-trace", llvm, gdb, lldb };
+    const Check = enum { errors, stdout, exit, @"error-trace", @"stack-trace", panic, llvm, gdb, lldb };
     fn checkSuccess(
         comp: *Compiler,
         update: *const Update,
@@ -2516,7 +2599,7 @@ const Compiler = struct {
         const script_path, const script_file, var script_fw = script: switch (check) {
             .errors => unreachable,
             .stdout, .exit => .{ undefined, null, undefined },
-            .@"error-trace", .@"stack-trace" => {
+            .@"error-trace", .@"stack-trace", .panic => {
                 _ = environ_map.swapRemove("CLICOLOR_FORCE");
                 try environ_map.put("NO_COLOR", "1"); // affects output formatting
                 break :script .{ undefined, null, undefined };
@@ -2940,7 +3023,7 @@ const Compiler = struct {
         const result = std.process.run(gpa, io, .{
             .exe = exe: switch (check) {
                 .errors, .llvm => unreachable,
-                .stdout, .exit, .@"error-trace", .@"stack-trace" => if (use_executor)
+                .stdout, .exit, .@"error-trace", .@"stack-trace", .panic => if (use_executor)
                     .search
                 else
                     .{ .file = emit_file },
@@ -3009,7 +3092,7 @@ const Compiler = struct {
             .inherit_files = switch (check) {
                 .errors, .llvm => unreachable,
                 .stdout, .exit, .gdb, .lldb => &.{},
-                .@"error-trace", .@"stack-trace" => &.{emit_file},
+                .@"error-trace", .@"stack-trace", .panic => &.{emit_file},
             },
         }) catch |err| if (use_executor) {
             // Chances are the foreign executor isn't available. Skip this evaluation.
@@ -3042,10 +3125,16 @@ const Compiler = struct {
                     const actual = std.mem.print(&actual_buffer, "{d}", .{code}) catch unreachable;
                     try update.checkPattern("exit code", expected, actual, &.{});
                 },
-                .@"stack-trace", .@"error-trace" => {
-                    if (code != 1) return update.fail(
-                        "{q} exited with code {d}, expected code 1",
-                        .{ emit_path, code },
+                .@"error-trace", .@"stack-trace", .panic => {
+                    const expected_code: u8 = switch (check) {
+                        else => unreachable,
+                        .@"error-trace" => 1,
+                        .@"stack-trace" => 0,
+                        .panic => 1,
+                    };
+                    if (code != expected_code) return update.fail(
+                        "{q} exited with code {d}, expected code {d}",
+                        .{ emit_path, code, expected_code },
                     );
                     try update.checkPattern("stderr", expected, result.stderr, &.{
                         .{ "\n", .anon, newline },
@@ -3077,12 +3166,22 @@ const Compiler = struct {
                                 } },
                             } },
                         } },
-                        .{ "(test*)", .anon, &.{
-                            .{ .literal = "(test" },
+                        .{ " (test*)\n", .anon, &[_]Pattern{
+                            .{ .literal = " (test" },
                             .{ .@"?" = &.{
                                 .{ .literal = ".zig" },
                             } },
                             .{ .literal = ")" },
+                        } ++ newline },
+                        .{ "...\n", .anon, &.{
+                            .{ .@"+" = &[_]Pattern{
+                                .{ .@"*" = &.{
+                                    .{ .none = &.{
+                                        .{ '\n', '\n' },
+                                        .{ '\r', '\r' },
+                                    } },
+                                } },
+                            } ++ newline },
                         } },
                     });
                     try update.checkPattern("stdout", "", result.stdout, &.{});
@@ -3163,7 +3262,10 @@ const Compiler = struct {
             .backend = null,
             .optimize = parent_comp.target.optimize,
             .pic = parent_comp.target.pic,
+            .frame_pointers = parent_comp.target.frame_pointers,
+            .unwind_tables = parent_comp.target.unwind_tables,
             .linker = parent_comp.target.linker,
+            .linkage = parent_comp.target.linkage,
             .link_libc = parent_comp.target.link_libc,
             .strip = parent_comp.target.strip,
         }) catch |err| switch (err) {

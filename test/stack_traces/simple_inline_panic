@@ -1,0 +1,24 @@
+#skip armeb-linux-musleabihf-baseline-whole-llvm-debug-dynamic-lc
+#skip s390x-linux-musl-baseline-whole-llvm-debug-dynamic-lc
+
+#zig build-exe {
+--name test
+-Mroot=test.zig
+#}
+
+#write test.zig {
+pub fn main() void {
+    foo(false);
+    foo(true);
+}
+inline fn foo(b: bool) void {
+    if (b) @panic("oh no");
+}
+#}
+#update
+#check panic {
+panic: oh no
+test.zig:6:12: 0x? in foo (test*)
+    if (b) @panic("oh no");
+           ^...
+#}

@@ -10,7 +10,6 @@ const libc = @import("libc.zig");
 const link = @import("link.zig");
 
 // Implementations
-pub const StackTracesContext = @import("src/StackTrace.zig");
 pub const LibcContext = @import("src/Libc.zig");
 pub const LinkContext = @import("src/Link.zig");
 
@@ -2224,30 +2223,6 @@ const link_targets = blk: {
     };
 };
 
-pub fn addStackTraceTests(b: *std.Build, options: StackTracesContext.Options) *Step {
-    const step = b.step("test-stack-traces", "Run the stack trace tests");
-
-    const convert_exe = b.addExecutable(.{
-        .name = "convert-stack-trace",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/src/convert-stack-trace.zig"),
-            .target = b.graph.host,
-            .optimize = .debug,
-        }),
-    });
-
-    const stack_traces_context = b.allocator.create(StackTracesContext) catch @panic("OOM");
-    stack_traces_context.* = .{
-        .b = b,
-        .step = step,
-        .options = options,
-        .convert_exe = convert_exe,
-    };
-    stack_traces_context.addCases();
-
-    return step;
-}
-
 pub fn addStandaloneTests(
     b: *std.Build,
     optimize_modes: []const OptimizeMode,
@@ -3100,6 +3075,7 @@ pub const RunnerTarget = @import("Runner.zig").Target;
 pub const RunnerOptions = struct {
     test_filters: []const []const u8,
     test_target_filters: []const []const u8,
+    test_extra_targets: bool,
     skip_non_native: bool,
     skip_wasm: bool,
     skip_freebsd: bool,
@@ -3168,6 +3144,8 @@ pub fn addRunnerTests(
 
             const skip = skip: {
                 const resolved_target = b.resolveTargetQuery(test_target.toQuery());
+
+                if (!options.test_extra_targets and test_target.extra) break :skip true;
 
                 if (options.skip_non_native and !std.zig.target.isNative(
                     &resolved_target.query,
